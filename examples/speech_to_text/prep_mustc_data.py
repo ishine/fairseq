@@ -37,7 +37,8 @@ from fairseq.data.audio.audio_utils import get_waveform, convert_waveform
 log = logging.getLogger(__name__)
 
 
-MANIFEST_COLUMNS = ["id", "audio", "n_frames", "tgt_text", "speaker"]
+MANIFEST_COLUMNS = ["id", "audio", "n_frames", "tgt_text", "speaker", 
+                    "src_text", "src_lang", "tgt_lang"]
 
 
 class MUSTC(Dataset):
@@ -48,12 +49,15 @@ class MUSTC(Dataset):
     """
 
     SPLITS = ["train", "dev", "tst-COMMON", "tst-HE"]
-    LANGUAGES = ["de", "es", "fr", "it", "nl", "pt", "ro", "ru"]
+    LANGUAGES = ["de", "es", "fr", "it", "nl", "pt", "ro", "ru", "ar", "cs", "fa", "tr", "vi", "zh"]
 
-    def __init__(self, root: str, lang: str, split: str) -> None:
+    def __init__(self, root: str, lang: str, split: str, speed_pertub=1.0) -> None:
         assert split in self.SPLITS and lang in self.LANGUAGES
         _root = Path(root) / f"en-{lang}" / "data" / split
-        wav_root, txt_root = _root / "wav", _root / "txt"
+        speed_suffix = "" if speed_pertub == 1.0 else f"_speed{speed_pertub}"
+        wav_root, txt_root = _root / f"wav{speed_suffix}", _root / "txt"
+        print(f"Speed pertubation rate: {speed_pertub}")
+        print(f"wav path root: {wav_root}")
         assert _root.is_dir() and wav_root.is_dir() and txt_root.is_dir()
         # Load audio segments
         try:
@@ -72,12 +76,17 @@ class MUSTC(Dataset):
         # Gather info
         self.data = []
         for wav_filename, _seg_group in groupby(segments, lambda x: x["wav"]):
+            wav_filename = (wav_filename if speed_pertub == 1.0 
+                else f"{wav_filename.split('.')[0]}.speed{speed_pertub}.wav"
+            )
             wav_path = wav_root / wav_filename
             sample_rate = sf.info(wav_path.as_posix()).samplerate
             seg_group = sorted(_seg_group, key=lambda x: x["offset"])
             for i, segment in enumerate(seg_group):
-                offset = int(float(segment["offset"]) * sample_rate)
-                n_frames = int(float(segment["duration"]) * sample_rate)
+                offset = float(segment["offset"]) / speed_pertub
+                offset = int(offset * sample_rate)
+                duration = float(segment["duration"]) / speed_pertub
+                n_frames = int(duration * sample_rate)
                 _id = f"{wav_path.stem}_{i}"
                 self.data.append(
                     (
@@ -89,6 +98,8 @@ class MUSTC(Dataset):
                         segment[lang],
                         segment["speaker_id"],
                         _id,
+                        "en",
+                        lang,
                     )
                 )
 
@@ -96,10 +107,10 @@ class MUSTC(Dataset):
             self, n: int
     ) -> Tuple[torch.Tensor, int, str, str, str, str]:
         wav_path, offset, n_frames, sr, src_utt, tgt_utt, spk_id, \
-            utt_id = self.data[n]
+            utt_id, src_lang, tgt_lang = self.data[n]
         waveform, _ = get_waveform(wav_path, frames=n_frames, start=offset)
         waveform = torch.from_numpy(waveform)
-        return waveform, sr, src_utt, tgt_utt, spk_id, utt_id
+        return waveform, sr, src_utt, tgt_utt, spk_id, utt_id, src_lang, tgt_lang
 
     def __len__(self) -> int:
         return len(self.data)
@@ -107,28 +118,32 @@ class MUSTC(Dataset):
 
 def process(args):
     root = Path(args.data_root).absolute()
-    for lang in MUSTC.LANGUAGES:
+    processed_langs = MUSTC.LANGUAGES
+    speed_suffix = "" if float(args.speed_pertub) == 1.0 else f"_speed{args.speed_pertub}"
+    if args.langs is not None:
+        processed_langs = args.langs.split(",")
+    for lang in processed_langs:
         cur_root = root / f"en-{lang}"
         if not cur_root.is_dir():
             print(f"{cur_root.as_posix()} does not exist. Skipped.")
             continue
         # Extract features
-        audio_root = cur_root / ("flac" if args.use_audio_input else "fbank80")
+        audio_root = cur_root / ("wav_split" if args.use_audio_input else f"fbank80{speed_suffix}")
         audio_root.mkdir(exist_ok=True)
 
         for split in MUSTC.SPLITS:
             print(f"Fetching split {split}...")
-            dataset = MUSTC(root.as_posix(), lang, split)
+            dataset = MUSTC(root.as_posix(), lang, split, speed_pertub=float(args.speed_pertub))
             if args.use_audio_input:
                 print("Converting audios...")
-                for waveform, sample_rate, _, _, _, utt_id in tqdm(dataset):
+                for waveform, sample_rate, _, _, _, utt_id, _, _ in tqdm(dataset):
                     tgt_sample_rate = 16_000
                     _wavform, _ = convert_waveform(
                         waveform, sample_rate, to_mono=True,
                         to_sample_rate=tgt_sample_rate
                     )
                     sf.write(
-                        (audio_root / f"{utt_id}.flac").as_posix(),
+                        (audio_root / f"{utt_id}.wav").as_posix(),
                         _wavform.T.numpy(), tgt_sample_rate
                     )
             else:
@@ -137,7 +152,7 @@ def process(args):
                 if split == 'train' and args.cmvn_type == "global":
                     print("And estimating cepstral mean and variance stats...")
 
-                for waveform, sample_rate, _, _, _, utt_id in tqdm(dataset):
+                for waveform, sample_rate, _, _, _, utt_id, _, _ in tqdm(dataset):
                     features = extract_fbank_features(
                         waveform, sample_rate, audio_root / f"{utt_id}.npy"
                     )
@@ -152,22 +167,30 @@ def process(args):
                         np.savez(f, mean=stats["mean"], std=stats["std"])
 
         # Pack features into ZIP
-        zip_path = cur_root / f"{audio_root.name}.zip"
-        print("ZIPing audios/features...")
-        create_zip(audio_root, zip_path)
-        print("Fetching ZIP manifest...")
-        audio_paths, audio_lengths = get_zip_manifest(
-            zip_path,
-            is_audio=args.use_audio_input,
-        )
+        if (not args.use_audio_input) or (args.zip_file):
+            zip_path = cur_root / f"{audio_root.name}.zip"
+            print("ZIPing audios/features...")
+            create_zip(audio_root, zip_path)
+            print("Fetching ZIP manifest...")
+            audio_paths, audio_lengths = get_zip_manifest(
+                zip_path, is_audio=args.use_audio_input
+            )
+        else:
+            print("Getting audio paths and audio lengths")
+            audio_paths, audio_lengths = {}, {}
+            paths = list(audio_root.glob(f"*.wav"))
+            for p in paths:
+                audio_id = Path(p).stem
+                audio_paths[audio_id] = p
+                audio_lengths[audio_id] = sf.info(p).frames
         # Generate TSV manifest
         print("Generating manifest...")
         train_text = []
         for split in MUSTC.SPLITS:
             is_train_split = split.startswith("train")
             manifest = {c: [] for c in MANIFEST_COLUMNS}
-            dataset = MUSTC(args.data_root, lang, split)
-            for _, _, src_utt, tgt_utt, speaker_id, utt_id in tqdm(dataset):
+            dataset = MUSTC(args.data_root, lang, split, speed_pertub=float(args.speed_pertub))
+            for _, _, src_utt, tgt_utt, speaker_id, utt_id, src_lg, tgt_lg in tqdm(dataset):
                 manifest["id"].append(utt_id)
                 manifest["audio"].append(audio_paths[utt_id])
                 manifest["n_frames"].append(audio_lengths[utt_id])
@@ -175,14 +198,21 @@ def process(args):
                     src_utt if args.task == "asr" else tgt_utt
                 )
                 manifest["speaker"].append(speaker_id)
+                manifest["src_text"].append(src_utt)
+                manifest["src_lang"].append(src_lg)
+                manifest["tgt_lang"].append(tgt_lg)
             if is_train_split:
                 train_text.extend(manifest["tgt_text"])
             df = pd.DataFrame.from_dict(manifest)
-            df = filter_manifest_df(df, is_train_split=is_train_split)
-            save_df_to_tsv(df, cur_root / f"{split}_{args.task}.tsv")
+            if not args.use_audio_input:
+                df = filter_manifest_df(df, is_train_split=is_train_split, 
+                                        min_n_frames=args.min_n_frames, 
+                                        max_n_frames=args.max_n_frames,
+                                        )
+            save_df_to_tsv(df, cur_root / f"{split}_{args.task}{speed_suffix}.tsv")
         # Generate vocab
         v_size_str = "" if args.vocab_type == "char" else str(args.vocab_size)
-        spm_filename_prefix = f"spm_{args.vocab_type}{v_size_str}_{args.task}"
+        spm_filename_prefix = f"spm_{args.vocab_type}{v_size_str}_{args.task}{speed_suffix}"
         with NamedTemporaryFile(mode="w") as f:
             for t in train_text:
                 f.write(t + "\n")
@@ -197,7 +227,7 @@ def process(args):
             gen_config_yaml(
                 cur_root,
                 spm_filename=spm_filename_prefix + ".model",
-                yaml_filename=f"config_{args.task}.yaml",
+                yaml_filename=f"config_{args.vocab_type}{v_size_str}_{args.task}.yaml",
                 specaugment_policy=None,
                 extra={"use_audio_input": True}
             )
@@ -205,7 +235,7 @@ def process(args):
             gen_config_yaml(
                 cur_root,
                 spm_filename=spm_filename_prefix + ".model",
-                yaml_filename=f"config_{args.task}.yaml",
+                yaml_filename=f"config_{args.vocab_type}{v_size_str}_{args.task}{speed_suffix}.yaml",
                 specaugment_policy="lb",
                 cmvn_type=args.cmvn_type,
                 gcmvn_path=(
@@ -214,7 +244,8 @@ def process(args):
                 ),
             )
         # Clean up
-        shutil.rmtree(audio_root)
+        if (not args.use_audio_input) or (args.zip_file):
+            shutil.rmtree(audio_root)
 
 
 def process_joint(args):
@@ -224,16 +255,21 @@ def process_joint(args):
     ), "do not have downloaded data available for all 8 languages"
     # Generate vocab
     vocab_size_str = "" if args.vocab_type == "char" else str(args.vocab_size)
-    spm_filename_prefix = f"spm_{args.vocab_type}{vocab_size_str}_{args.task}"
+    spm_filename_prefix = f"spm_{args.vocab_type}{vocab_size_str}_{args.task}_joint"
     with NamedTemporaryFile(mode="w") as f:
         for lang in MUSTC.LANGUAGES:
             tsv_path = cur_root / f"en-{lang}" / f"train_{args.task}.tsv"
             df = load_df_from_tsv(tsv_path)
             for t in df["tgt_text"]:
                 f.write(t + "\n")
+            # get transcriptions from the pair having the most number of sentences
+            if args.joint_asr_st and lang == "fr": 
+                for t in df["src_text"]:
+                    f.write(t + "\n")
         special_symbols = None
         if args.task == 'st':
-            special_symbols = [f'<lang:{lang}>' for lang in MUSTC.LANGUAGES]
+            special_symbols = [f'<lang:{lang}>' for lang in MUSTC.LANGUAGES] \
+                if not args.joint_asr_st else [f'<lang:{lang}>' for lang in MUSTC.LANGUAGES + ["en"]]
         gen_vocab(
             Path(f.name),
             cur_root / spm_filename_prefix,
@@ -245,7 +281,7 @@ def process_joint(args):
     gen_config_yaml(
         cur_root,
         spm_filename=spm_filename_prefix + ".model",
-        yaml_filename=f"config_{args.task}.yaml",
+        yaml_filename=f"config_{args.vocab_type}{vocab_size_str}_{args.task}_joint.yaml",
         specaugment_policy="ld",
         prepend_tgt_lang_tag=(args.task == "st"),
     )
@@ -271,17 +307,22 @@ def main():
     parser.add_argument("--vocab-size", default=8000, type=int)
     parser.add_argument("--task", type=str, choices=["asr", "st"])
     parser.add_argument("--joint", action="store_true", help="")
-    parser.add_argument(
-        "--cmvn-type", default="utterance",
-        choices=["global", "utterance"],
-        help="The type of cepstral mean and variance normalization"
-    )
-    parser.add_argument(
-        "--gcmvn-max-num", default=150000, type=int,
-        help="Maximum number of sentences to use to estimate global mean and "
-             "variance"
-        )
     parser.add_argument("--use-audio-input", action="store_true")
+    parser.add_argument("--zip-file", action="store_true")
+    parser.add_argument("--langs", default=None, type=str, 
+        help="Target languages in the related pairs to process, seperated by comma")
+    parser.add_argument("--min-n-frames", default=5, type=int)
+    parser.add_argument("--max-n-frames", default=3000, type=int)
+    parser.add_argument("--speed-pertub", default=1.0, type=float)
+    parser.add_argument("--joint-asr-st", action="store_true", help="")
+    parser.add_argument("--cmvn-type", default="utterance",
+                        choices=["global", "utterance"],
+                        help="The type of cepstral mean and variance normalization")
+    parser.add_argument("--gcmvn-max-num", default=150000, type=int,
+                        help=(
+                            "Maximum number of sentences to use to estimate"
+                            "global mean and variance"
+                            ))
     args = parser.parse_args()
 
     if args.joint:

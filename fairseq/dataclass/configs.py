@@ -250,6 +250,22 @@ class CommonConfig(FairseqDataclass):
             "help": "path to run plasma_store, defaults to /tmp/plasma. Paths outside /tmp tend to fail."
         },
     )
+    clonefuse: int = field(
+        default=1,
+        metadata={"help": "closefuse"},
+    )
+    clone_last: int = field(
+        default=0,
+        metadata={"help": "closefuse"},
+    )
+    clone_first: int = field(
+        default=0,
+        metadata={"help": "closefuse"},
+    )
+    clone_type: Optional[str] = field(
+        default="linear",
+        metadata={"help": "closefuse"},
+    )
 
 
 @dataclass
@@ -1023,6 +1039,31 @@ class GenerationConfig(FairseqDataclass):
     eos_token: Optional[str] = field(
         default=None,
         metadata={"help": "EOS token"},
+    )
+    independent_beams: bool = field(
+        default=False, 
+        metadata={"help": "Independent beams used in dual-decoder Transformer"},
+    )
+    dual_beams: bool = field(
+        default=False, 
+        metadata={"help": "Single joint beam used in dual-decoder Transformer"},
+    )
+    waitk: int = field(
+        default=0, 
+        metadata={"help": "Wait-k decoding strategy where one decoder is k steps \
+                ahead of the other decoder"},
+    )
+    waitk_ensemble: str = field(
+        default="", 
+        metadata={"help": "Use ensemble of different values for waitk."},
+    )
+    weight_score: float = field(
+        default=0.5, 
+        metadata={"help": "Weight of sum of scores in dual-beams."},
+    )
+    asr_diverse_width: int = field(
+        default=0, 
+        metadata={"help": "Maximum number of diverse tokens in ASR sub-beam."},
     )
 
 

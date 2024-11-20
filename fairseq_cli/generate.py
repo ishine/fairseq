@@ -59,7 +59,7 @@ def get_symbols_to_strip_from_output(generator):
 
 def _main(cfg: DictConfig, output_file):
     logging.basicConfig(
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        format="%(asctime)s | %(levelname)s | %(filename)s:%(lineno)d | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         level=os.environ.get("LOGLEVEL", "INFO").upper(),
         stream=output_file,
@@ -185,13 +185,20 @@ def _main(cfg: DictConfig, output_file):
     has_target = True
     wps_meter = TimeMeter()
     for sample in progress:
+        multi_targets = False if not isinstance(sample["target"], list) else True
+        num_targets = len(sample["target"]) if multi_targets else 1
         sample = utils.move_to_cuda(sample) if use_cuda else sample
         if "net_input" not in sample:
             continue
 
         prefix_tokens = None
         if cfg.generation.prefix_size > 0:
-            prefix_tokens = sample["target"][:, : cfg.generation.prefix_size]
+            # if target is a list of 2 tensors, then we are using dd_transformer 
+            if not multi_targets:
+                prefix_tokens = sample["target"][:, : cfg.generation.prefix_size]
+            else:
+                prefix_tokens = tuple(
+                    [sample["target"][k][:, : cfg.generation.prefix_size] for k in range(num_targets)])
 
         constraints = None
         if "constraints" in sample:
@@ -205,14 +212,21 @@ def _main(cfg: DictConfig, output_file):
             prefix_tokens=prefix_tokens,
             constraints=constraints,
         )
-        num_generated_tokens = sum(len(h[0]["tokens"]) for h in hypos)
+        if not multi_targets:
+            num_generated_tokens = sum(len(h[0]["tokens"]) for h in hypos)
+        else:
+            num_generated_tokens = sum(len(h[0]["tokens"][0]) + len(h[0]["tokens"][1]) for h in hypos)
         gen_timer.stop(num_generated_tokens)
 
         for i, sample_id in enumerate(sample["id"].tolist()):
             has_target = sample["target"] is not None
 
             # Remove padding
-            if "src_tokens" in sample["net_input"]:
+            if "src_txt_tokens" in sample["net_input"]:
+                src_tokens = utils.strip_pad(
+                    sample["net_input"]["src_txt_tokens"][i, :], tgt_dict.pad()
+                )
+            elif "src_tokens" in sample["net_input"]:
                 src_tokens = utils.strip_pad(
                     sample["net_input"]["src_tokens"][i, :], tgt_dict.pad()
                 )
@@ -221,8 +235,14 @@ def _main(cfg: DictConfig, output_file):
 
             target_tokens = None
             if has_target:
-                target_tokens = (
-                    utils.strip_pad(sample["target"][i, :], tgt_dict.pad()).int().cpu()
+                if not multi_targets:
+                    target_tokens = (
+                        utils.strip_pad(sample["target"][i, :], tgt_dict.pad()).int().cpu()
+                    )
+                else:
+                    target_tokens = tuple(
+                    [utils.strip_pad(sample["target"][k][i, :], tgt_dict.pad()).int().cpu()
+                    for k in range(num_targets)]
                 )
 
             # Either retrieve the original sentences or regenerate them from tokens.
@@ -234,69 +254,143 @@ def _main(cfg: DictConfig, output_file):
                     sample_id
                 )
             else:
-                if src_dict is not None:
-                    src_str = src_dict.string(src_tokens, cfg.common_eval.post_process)
-                else:
-                    src_str = ""
+                src_str = ""
+                # if src_dict is not None:
+                #     src_str = src_dict.string(src_tokens, cfg.common_eval.post_process)
+                # else:
+                #     src_str = ""
                 if has_target:
-                    target_str = tgt_dict.string(
-                        target_tokens,
-                        cfg.common_eval.post_process,
-                        escape_unk=True,
-                        extra_symbols_to_ignore=get_symbols_to_strip_from_output(
-                            generator
-                        ),
-                    )
+                    if not multi_targets:
+                        target_str = tgt_dict.string(
+                            target_tokens,
+                            cfg.common_eval.post_process,
+                            escape_unk=True,
+                            extra_symbols_to_ignore=get_symbols_to_strip_from_output(
+                                generator
+                            ),
+                        )
+                    else:
+                        target_str = [tgt_dict.string(
+                            target_tokens[k],
+                            cfg.common_eval.post_process,
+                            escape_unk=True,
+                            extra_symbols_to_ignore=get_symbols_to_strip_from_output(
+                                generator
+                            ),
+                    ) for k in range(num_targets)]
 
             src_str = decode_fn(src_str)
             if has_target:
-                target_str = decode_fn(target_str)
+                if not multi_targets:
+                    target_str = decode_fn(target_str)
+                else:
+                    target_str = [decode_fn(target_str[k]) for k in range(num_targets)]
 
             if not cfg.common_eval.quiet:
                 if src_dict is not None:
                     print("S-{}\t{}".format(sample_id, src_str), file=output_file)
                 if has_target:
-                    print("T-{}\t{}".format(sample_id, target_str), file=output_file)
+                    if not multi_targets:
+                        print("T-{}\t{}".format(sample_id, target_str), file=output_file)
+                    else:
+                        for k in range(num_targets):
+                            print("T{}-{}\t{}".format(k, sample_id, target_str[k]), file=output_file)
 
             # Process top predictions
             for j, hypo in enumerate(hypos[i][: cfg.generation.nbest]):
                 hypo_tokens, hypo_str, alignment = utils.post_process_prediction(
-                    hypo_tokens=hypo["tokens"].int().cpu(),
+                    hypo_tokens=hypo["tokens"],
                     src_str=src_str,
                     alignment=hypo["alignment"],
                     align_dict=align_dict,
                     tgt_dict=tgt_dict,
                     remove_bpe=cfg.common_eval.post_process,
                     extra_symbols_to_ignore=get_symbols_to_strip_from_output(generator),
+                    has_two_targets=multi_targets,
                 )
-                detok_hypo_str = decode_fn(hypo_str)
+                detok_hypo_str = decode_fn(hypo_str) if not multi_targets \
+                    else [decode_fn(hypo_str[k]) for k in range(num_targets)]
                 if not cfg.common_eval.quiet:
-                    score = hypo["score"] / math.log(2)  # convert to base 2
+                    single_beam = False if (
+                        isinstance(hypo["score"], list) or isinstance(hypo["score"], tuple)
+                    ) else True
+                    if single_beam:
+                        score = hypo["score"] / math.log(2)  # convert to base 2
+                    else:
+                        score = tuple([hypo["score"][k] / math.log(2) for k in range(num_targets)])
                     # original hypothesis (after tokenization and BPE)
-                    print(
-                        "H-{}\t{}\t{}".format(sample_id, score, hypo_str),
-                        file=output_file,
-                    )
-                    # detokenized hypothesis
-                    print(
-                        "D-{}\t{}\t{}".format(sample_id, score, detok_hypo_str),
-                        file=output_file,
-                    )
-                    print(
-                        "P-{}\t{}".format(
-                            sample_id,
-                            " ".join(
-                                map(
-                                    lambda x: "{:.4f}".format(x),
-                                    # convert from base e to base 2
-                                    hypo["positional_scores"]
-                                    .div_(math.log(2))
-                                    .tolist(),
-                                )
+                    if not multi_targets:
+                        print(
+                            "H-{}\t{}\t{}".format(sample_id, score, hypo_str),
+                            file=output_file,
+                        )
+                        # detokenized hypothesis
+                        print(
+                            "D-{}\t{}\t{}".format(sample_id, score, detok_hypo_str),
+                            file=output_file,
+                        )
+                        print(
+                            "P-{}\t{}".format(
+                                sample_id,
+                                " ".join(
+                                    map(
+                                        lambda x: "{:.4f}".format(x),
+                                        # convert from base e to base 2
+                                        hypo["positional_scores"]
+                                        .div_(math.log(2))
+                                        .tolist(),
+                                    )
+                                ),
                             ),
-                        ),
-                        file=output_file,
-                    )
+                            file=output_file,
+                        )
+                    else:
+                        for k in range(num_targets):
+                            _score = score if single_beam else score[k]
+                            print(
+                                "H{}-{}\t{}\t{}".format(k, sample_id, _score, hypo_str[k]),
+                                file=output_file,
+                                )
+                        for k in range(num_targets):
+                            _score = score if single_beam else score[k]
+                            # detokenized hypothesis
+                            print(
+                                "D{}-{}\t{}\t{}".format(k, sample_id, _score, detok_hypo_str[k]),
+                                file=output_file,
+                                )
+                        if single_beam:
+                            print(
+                                "P-{}\t{}".format(
+                                    sample_id,
+                                    " ".join(
+                                        map(
+                                            lambda x: "{:.4f}".format(x),
+                                            # convert from base e to base 2
+                                            hypo["positional_scores"]
+                                            .div_(math.log(2))
+                                            .tolist(),
+                                        )
+                                    ),
+                                ),
+                                file=output_file,
+                            )
+                        else:
+                            for i in range(num_targets):
+                                print(
+                                "P-{}\t{}".format(
+                                    sample_id,
+                                    " ".join(
+                                        map(
+                                            lambda x: "{:.4f}".format(x),
+                                            # convert from base e to base 2
+                                            hypo["positional_scores"][k]
+                                            .div_(math.log(2))
+                                            .tolist()[0],
+                                        )
+                                    ),
+                                ),
+                                file=output_file,
+                            )
 
                     if cfg.generation.print_alignment == "hard":
                         print(
@@ -345,17 +439,26 @@ def _main(cfg: DictConfig, output_file):
 
                 # Score only the top hypothesis
                 if has_target and j == 0:
-                    if (
-                        align_dict is not None
-                        or cfg.common_eval.post_process is not None
-                    ):
-                        # Convert back to tokens for evaluation with unk replacement and/or without BPE
-                        target_tokens = tgt_dict.encode_line(
-                            target_str, add_if_not_exist=True
-                        )
-                        hypo_tokens = tgt_dict.encode_line(
-                            detok_hypo_str, add_if_not_exist=True
-                        )
+                    if not multi_targets:
+                        if align_dict is not None or cfg.common_eval.post_process is not None:
+                            # Convert back to tokens for evaluation with unk replacement and/or without BPE
+                            target_tokens = tgt_dict.encode_line(
+                                target_str, add_if_not_exist=True
+                            )
+                            hypo_tokens = tgt_dict.encode_line(
+                                detok_hypo_str, add_if_not_exist=True
+                            )
+                    else:
+                        if align_dict is not None or cfg.common_eval.post_process is not None:
+                            # Convert back to tokens for evaluation with unk replacement and/or without BPE
+                            target_tokens = [tgt_dict.encode_line(
+                                target_str[k], add_if_not_exist=True
+                                ) for k in range(num_targets)
+                            ]
+                            hypo_tokens = [tgt_dict.encode_line(
+                                detok_hypo_str[k], add_if_not_exist=True
+                                ) for k in range(num_targets)
+                            ]
                     if hasattr(scorer, "add_string"):
                         scorer.add_string(target_str, detok_hypo_str)
                     else:

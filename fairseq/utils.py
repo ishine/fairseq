@@ -238,18 +238,35 @@ def post_process_prediction(
     tgt_dict,
     remove_bpe=None,
     extra_symbols_to_ignore=None,
+    has_two_targets=False,
 ):
-    hypo_str = tgt_dict.string(
-        hypo_tokens, remove_bpe, extra_symbols_to_ignore=extra_symbols_to_ignore
-    )
-    if align_dict is not None:
-        hypo_str = replace_unk(
-            hypo_str, src_str, alignment, align_dict, tgt_dict.unk_string()
+    if not has_two_targets:
+        hypo_tokens = hypo_tokens.int().cpu()
+        hypo_str = tgt_dict.string(
+            hypo_tokens, remove_bpe, extra_symbols_to_ignore=extra_symbols_to_ignore
         )
+    else:
+        hypo_tokens = [hypo_tokens[i].int().cpu() for i in range(2)]
+        hypo_str = [tgt_dict.string(
+            hypo_tokens[i], remove_bpe, extra_symbols_to_ignore=extra_symbols_to_ignore
+        ) for i in range(2)]
+    if align_dict is not None:
+        if not has_two_targets:
+            hypo_str = replace_unk(
+                hypo_str, src_str, alignment, align_dict, tgt_dict.unk_string()
+            )
+        else:
+            hypo_str = [replace_unk(
+                hypo_str[i], src_str, alignment, align_dict, tgt_dict.unk_string()
+        ) for i in range(2)]
     if align_dict is not None or remove_bpe is not None:
         # Convert back to tokens for evaluating with unk replacement or without BPE
         # Note that the dictionary can be modified inside the method.
-        hypo_tokens = tgt_dict.encode_line(hypo_str, add_if_not_exist=True)
+        if not has_two_targets:
+            hypo_tokens = tgt_dict.encode_line(hypo_str, add_if_not_exist=True)
+        else:
+            hypo_tokens = [tgt_dict.encode_line(hypo_str[i], add_if_not_exist=True)
+                            for i in range(2)]
     return hypo_tokens, hypo_str, alignment
 
 

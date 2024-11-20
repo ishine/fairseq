@@ -89,11 +89,13 @@ class SpeechToTextDataset(FairseqDataset):
         n_frames_per_step=1,
         speaker_to_id=None,
         append_eos=True,
+        subtasks: Optional[str] = None,
     ):
         self.split, self.is_train_split = split, is_train_split
         self.cfg = cfg
         self.audio_paths, self.n_frames = audio_paths, n_frames
         self.n_samples = len(audio_paths)
+        self.subtasks = subtasks.split("_") if subtasks is not None else subtasks
         assert len(n_frames) == self.n_samples > 0
         assert src_texts is None or len(src_texts) == self.n_samples
         assert tgt_texts is None or len(tgt_texts) == self.n_samples
@@ -105,8 +107,10 @@ class SpeechToTextDataset(FairseqDataset):
             tgt_dict is not None and tgt_texts is not None
         )
         self.src_texts, self.tgt_texts = src_texts, tgt_texts
+        self.texts = [self.src_texts, self.tgt_texts] if self.subtasks is not None else []
         self.src_langs, self.tgt_langs = src_langs, tgt_langs
         self.speakers = speakers
+        self.langs = [self.src_langs, self.tgt_langs] if self.subtasks is not None else []
         self.tgt_dict = tgt_dict
         self.check_tgt_lang_tag()
         self.ids = ids
@@ -181,6 +185,11 @@ class SpeechToTextDataset(FairseqDataset):
             tgt_lang_tags = [
                 self.LANG_TAG_TEMPLATE.format(t) for t in set(self.tgt_langs)
             ]
+            if all("_" in l for l in self.tgt_langs): # mbart style
+                tgt_lang_tags = [
+                    "[{}]".format(t) for t in set(self.tgt_langs)
+            ]
+            logging.info(f'{dict({l: self.tgt_dict.index(l) for l in tgt_lang_tags})}')
             assert all(t in self.tgt_dict for t in tgt_lang_tags)
 
     @classmethod
@@ -196,6 +205,11 @@ class SpeechToTextDataset(FairseqDataset):
         text = self.tokenize(self.pre_tokenizer, text)
         text = self.tokenize(self.bpe_tokenizer, text)
         return text
+    
+    def get_tokenized_text(self, index: int, subtask_index: int):
+        text = self.tokenize(self.pre_tokenizer, self.texts[subtask_index][index])
+        text = self.tokenize(self.bpe_tokenizer, text)
+        return text
 
     def pack_frames(self, feature: torch.Tensor):
         if self.n_frames_per_step == 1:
@@ -205,8 +219,11 @@ class SpeechToTextDataset(FairseqDataset):
         return feature.reshape(n_packed_frames, -1)
 
     @classmethod
-    def get_lang_tag_idx(cls, lang: str, dictionary: Dictionary):
-        lang_tag_idx = dictionary.index(cls.LANG_TAG_TEMPLATE.format(lang))
+    def get_lang_tag_idx(cls, lang: str, dictionary: Dictionary, style="s2t"):
+        if style == "s2t":
+            lang_tag_idx = dictionary.index(cls.LANG_TAG_TEMPLATE.format(lang))
+        elif style == "mbart":
+            lang_tag_idx = dictionary.index("[{}]".format(lang))
         assert lang_tag_idx != dictionary.unk()
         return lang_tag_idx
 
@@ -261,25 +278,39 @@ class SpeechToTextDataset(FairseqDataset):
         source = self._get_source_audio(indices if has_concat else index)
         source = self.pack_frames(source)
 
-        target = None
-        if self.tgt_texts is not None:
-            tokenized = self.get_tokenized_tgt_text(indices if has_concat else index)
-            target = self.tgt_dict.encode_line(
-                tokenized, add_if_not_exist=False, append_eos=self.append_eos
-            ).long()
-            if self.cfg.prepend_tgt_lang_tag:
-                lang_tag_idx = self.get_lang_tag_idx(
-                    self.tgt_langs[index], self.tgt_dict
-                )
-                target = torch.cat((torch.LongTensor([lang_tag_idx]), target), 0)
-
-        if self.cfg.prepend_bos_and_append_tgt_lang_tag:
-            bos = torch.LongTensor([self.tgt_dict.bos()])
-            lang_tag_idx = self.get_lang_tag_idx(self.tgt_langs[index], self.tgt_dict)
-            assert lang_tag_idx != self.tgt_dict.unk()
-            lang_tag_idx = torch.LongTensor([lang_tag_idx])
-            target = torch.cat((bos, target, lang_tag_idx), 0)
-
+        if self.subtasks is None:
+            target = None
+            if self.tgt_texts is not None:
+                tokenized = self.get_tokenized_tgt_text(index)
+                target = self.tgt_dict.encode_line(
+                    tokenized, add_if_not_exist=False, append_eos=True
+                ).long()
+                if self.cfg.prepend_tgt_lang_tag:
+                    lang_tag_idx = self.get_lang_tag_idx(
+                        self.tgt_langs[index], self.tgt_dict,
+                        style="s2t" if not any("_" in l for l in self.tgt_langs) else "mbart"
+                    )
+                    target = torch.cat((torch.LongTensor([lang_tag_idx]), target), 0)
+            if self.cfg.prepend_bos_and_append_tgt_lang_tag:
+                bos = torch.LongTensor([self.tgt_dict.bos()])
+                lang_tag_idx = self.get_lang_tag_idx(self.tgt_langs[index], self.tgt_dict)
+                assert lang_tag_idx != self.tgt_dict.unk()
+                lang_tag_idx = torch.LongTensor([lang_tag_idx])
+                target = torch.cat((bos, target, lang_tag_idx), 0)
+        else:
+            target, tokenized = [None, None], [None, None]
+            if self.texts is not None:
+                for i in range(len(self.subtasks)):
+                    tokenized[i] = self.get_tokenized_text(index, i)
+                    target[i] = self.tgt_dict.encode_line(
+                        tokenized[i], add_if_not_exist=False, append_eos=True
+                    ).long()
+                    if self.cfg.prepend_tgt_lang_tag:
+                        lang_tag = self.LANG_TAG_TEMPLATE.format(self.langs[i][index])
+                        lang_tag_idx = self.tgt_dict.index(lang_tag)
+                        target[i] = torch.cat((torch.LongTensor([lang_tag_idx]), target[i]), 0)
+            target = tuple(target)
+        
         speaker_id = None
         if self.speaker_to_id is not None:
             speaker_id = self.speaker_to_id[self.speakers[index]]
@@ -310,30 +341,58 @@ class SpeechToTextDataset(FairseqDataset):
         indices = indices.index_select(0, order)
         frames = frames.index_select(0, order)
 
-        target, target_lengths = None, None
-        prev_output_tokens = None
-        ntokens = None
-        if self.tgt_texts is not None:
-            target = fairseq_data_utils.collate_tokens(
-                [x.target for x in samples],
-                self.tgt_dict.pad(),
-                self.tgt_dict.eos(),
-                left_pad=False,
-                move_eos_to_beginning=False,
-            )
-            target = target.index_select(0, order)
-            target_lengths = torch.tensor(
-                [x.target.size(0) for x in samples], dtype=torch.long
-            ).index_select(0, order)
-            prev_output_tokens = fairseq_data_utils.collate_tokens(
-                [x.target for x in samples],
-                self.tgt_dict.pad(),
-                eos_idx=None,
-                left_pad=False,
-                move_eos_to_beginning=True,
-            )
-            prev_output_tokens = prev_output_tokens.index_select(0, order)
-            ntokens = sum(x.target.size(0) for x in samples)
+        if self.subtasks is None:
+            target, target_lengths = None, None
+            prev_output_tokens = None
+            ntokens = None
+            if self.tgt_texts is not None:
+                target = fairseq_data_utils.collate_tokens(
+                    [x.target for x in samples],
+                    self.tgt_dict.pad(),
+                    self.tgt_dict.eos(),
+                    left_pad=False,
+                    move_eos_to_beginning=False,
+                )
+                target = target.index_select(0, order)
+                target_lengths = torch.tensor(
+                    [x.target.size(0) for x in samples], dtype=torch.long
+                ).index_select(0, order)
+                prev_output_tokens = fairseq_data_utils.collate_tokens(
+                    [x.target for x in samples],
+                    self.tgt_dict.pad(),
+                    eos_idx=None,
+                    left_pad=False,
+                    move_eos_to_beginning=True,
+                )
+                prev_output_tokens = prev_output_tokens.index_select(0, order)
+                ntokens = sum(x.target.size(0) for x in samples)
+        else:
+            target, target_lengths = [None, None], [None, None]
+            prev_output_tokens = [None, None]
+            ntokens = [None, None]
+            if self.texts is not None:
+                for i in range(len(self.subtasks)):
+                    target[i] = fairseq_data_utils.collate_tokens(
+                        [x.target[i] for x in samples],
+                        self.tgt_dict.pad(),
+                        self.tgt_dict.eos(),
+                        left_pad=False,
+                        move_eos_to_beginning=False,
+                    )
+                    target[i] = target[i].index_select(0, order)
+                    target_lengths[i] = torch.tensor(
+                        [x.target[i].size(0) for x in samples], 
+                        dtype=torch.long
+                    ).index_select(0, order)
+                    prev_output_tokens[i] = fairseq_data_utils.collate_tokens(
+                        [x.target[i] for x in samples],
+                        self.tgt_dict.pad(),
+                        eos_idx=None,
+                        left_pad=False,
+                        move_eos_to_beginning=True,
+                    )
+                    prev_output_tokens[i] = prev_output_tokens[i].index_select(0, order)
+                    ntokens[i] = sum(x.target[i].size(0) for x in samples)
 
         speaker = None
         if self.speaker_to_id is not None:
@@ -354,7 +413,7 @@ class SpeechToTextDataset(FairseqDataset):
             "speaker": speaker,
             "target": target,
             "target_lengths": target_lengths,
-            "ntokens": ntokens,
+            "ntokens": sum(ntokens) if isinstance(ntokens, list) else ntokens,
             "nsentences": len(samples),
         }
         if return_order:
@@ -365,7 +424,16 @@ class SpeechToTextDataset(FairseqDataset):
         return self.n_frames[index]
 
     def size(self, index):
-        return self.n_frames[index], self.tgt_lens[index]
+        t_len = 0
+        if self.subtasks is None:
+            if self.tgt_texts is not None:
+                tokenized = self.get_tokenized_tgt_text(index)
+                t_len = len(tokenized.split(" "))
+        else:
+            if self.texts is not None:
+                tokenized = tuple([self.get_tokenized_text(index, i) for i in range(len(self.subtasks))])
+                t_len = max([len(tokenized[i].split(" ")) for i in range(len(self.subtasks))])
+        return self.n_frames[index], t_len
 
     @property
     def sizes(self):
@@ -564,6 +632,7 @@ class SpeechToTextDatasetCreator(object):
         bpe_tokenizer,
         n_frames_per_step,
         speaker_to_id,
+        subtasks,
         multitask: Optional[Dict] = None,
     ) -> SpeechToTextDataset:
         audio_root = Path(cfg.audio_root)
@@ -597,6 +666,7 @@ class SpeechToTextDatasetCreator(object):
             pre_tokenizer=pre_tokenizer,
             bpe_tokenizer=bpe_tokenizer,
             n_frames_per_step=n_frames_per_step,
+            subtasks=subtasks,
             speaker_to_id=speaker_to_id,
         )
 
@@ -672,6 +742,7 @@ class SpeechToTextDatasetCreator(object):
         bpe_tokenizer,
         n_frames_per_step,
         speaker_to_id,
+        subtasks,
         multitask: Optional[Dict] = None,
     ) -> SpeechToTextDataset:
         samples = cls._load_samples_from_tsv(root, split)
@@ -685,6 +756,7 @@ class SpeechToTextDatasetCreator(object):
             bpe_tokenizer,
             n_frames_per_step,
             speaker_to_id,
+            subtasks,
             multitask,
         )
 
@@ -702,7 +774,9 @@ class SpeechToTextDatasetCreator(object):
         seed: int,
         n_frames_per_step: int = 1,
         speaker_to_id=None,
+        subtasks: str = None,
         multitask: Optional[Dict] = None,
+        homogeneous_batch: bool = False,
     ) -> SpeechToTextDataset:
         datasets = [
             cls._from_tsv(
@@ -715,6 +789,7 @@ class SpeechToTextDatasetCreator(object):
                 bpe_tokenizer=bpe_tokenizer,
                 n_frames_per_step=n_frames_per_step,
                 speaker_to_id=speaker_to_id,
+                subtasks=subtasks,
                 multitask=multitask,
             )
             for split in splits.split(",")
@@ -730,4 +805,4 @@ class SpeechToTextDatasetCreator(object):
                 for r, d in zip(size_ratios, datasets)
             ]
 
-        return ConcatDataset(datasets) if len(datasets) > 1 else datasets[0]
+        return ConcatDataset(datasets, homogeneous_batch=homogeneous_batch) if len(datasets) > 1 else datasets[0]

@@ -6,9 +6,11 @@
 import math
 
 from typing import List, Optional
+import logging
 
 import torch
 import torch.nn as nn
+from fairseq import utils
 from fairseq.token_generation_constraints import (
     ConstraintState,
     OrderedConstraintState,
@@ -890,3 +892,242 @@ class DiverseSiblingsSearch(Search):
             final_indices[i] = indices[i][final_indices[i]]
 
         return final_scores, final_indices, final_beams
+
+
+class DualBeamSearch_independent(Search):
+    def __init__(self, tgt_dict):
+        super().__init__(tgt_dict)
+        self.constraint_states = None
+
+    @torch.jit.export
+    def step(
+        self,
+        step: int,
+        lprobs: List[Tensor],
+        scores: Optional[Tensor],
+        prev_output_tokens: Optional[Tensor] = None,
+        original_batch_idxs: Optional[Tensor] = None,
+    ):
+        bsz, beam_size, vocab_size = lprobs[0].size()
+
+        if step == 0:
+            # at the first step all hypotheses are equally likely, so use
+            # only the first beam
+            for i in range(2):
+                lprobs[i] = lprobs[i][:, ::beam_size, :].contiguous()
+        else:
+            # make probs contain cumulative scores for each hypothesis
+            assert scores is not None
+            for i in range(2):
+                lprobs[i] = lprobs[i] + scores[i][:, :, step - 1].unsqueeze(-1)
+
+        top_prediction = [torch.topk(
+            lprobs[i].view(bsz, -1),
+            k=min(
+                # Take the best 2 x beam_size predictions. We'll choose the first
+                # beam_size of these which don't predict eos to continue with.
+                beam_size * 2,
+                lprobs[i].view(bsz, -1).size(1) - 1,  # -1 so we never select pad
+            ),
+        ) for i in range(2)]
+        scores_buf = [top_prediction[i][0] for i in range(2)]
+        indices_buf = [top_prediction[i][1] for i in range(2)]
+        # Project back into relative indices and beams
+        beams_buf = [indices_buf[i] // vocab_size for i in range(2)]
+        indices_buf = [indices_buf[i].fmod(vocab_size) for i in range(2)]
+        logging.info(f'scores_buf normalized:\n{scores_buf}')
+
+        # At this point, beams_buf and indices_buf are single-dim and contain relative indices
+        return scores_buf, indices_buf, beams_buf
+
+
+class DualBeamSearch_inefficient(Search):
+    def __init__(self, tgt_dict):
+        super().__init__(tgt_dict)
+        self.constraint_states = None
+
+    @torch.jit.export
+    def step(
+        self,
+        step: int,
+        lprobs: List[Tensor],
+        scores: Optional[Tensor],
+        prev_output_tokens: Optional[Tensor] = None,
+        original_batch_idxs: Optional[Tensor] = None,
+    ):
+        lprobs = torch.stack(lprobs)
+        if isinstance(scores, list) or isinstance(scores, tuple):
+            scores = torch.stack(scores)
+        _, bsz, beam_size, vocab_size = lprobs.size()
+
+        # Will select K candidates
+        K = beam_size*2
+        # Main beam size
+        B = beam_size if step > 0 else 1
+
+        if step == 0:
+            # at the first step all hypotheses are equally likely, so use
+            # only the first beam
+            # num_inputs x N x V
+            lprobs = lprobs[:, :, 0, :].contiguous()
+            # num_inputs x N x 1 x V
+            lprobs = lprobs.unsqueeze(-2)
+        else:
+            # make probs contain cumulative scores for each hypothesis
+            assert scores is not None
+            lprobs = lprobs + scores[:, :, :, step - 1].unsqueeze(-1)
+
+        scores0 = lprobs[0].view(-1, vocab_size)
+        scores1 = lprobs[1].view(-1, vocab_size)
+        # pairwise sum of scores: (NB, V, V)
+        scores = (torch.matmul(scores0.unsqueeze(-1), torch.ones_like(scores0).unsqueeze(1))
+                    + torch.matmul(torch.ones_like(scores1).unsqueeze(-1), scores1.unsqueeze(-1).transpose(1,2)))
+        # (N, BVV)
+        # logging.info(f'step = {step}, shape: {scores.shape}')
+        scores = scores.reshape(bsz, B*vocab_size*vocab_size)
+        # (N, 2K)
+        scores, inds = torch.topk(scores,
+                            k=min(K, B * vocab_size - 1))
+        beam_indices = inds // vocab_size**2
+        scoreVV_flatten_indices = inds.fmod(vocab_size**2)
+        subbeam1_indices = scoreVV_flatten_indices // vocab_size
+        subbeam2_indices = scoreVV_flatten_indices.fmod(vocab_size)
+
+        scores_buf = [scores, scores]
+        indices_buf = [subbeam1_indices, subbeam2_indices]
+        beams_buf = [beam_indices, beam_indices]
+
+        # At this point, beams_buf and indices_buf are single-dim and contain relative indices
+        return scores_buf, indices_buf, beams_buf
+
+
+def gather2D(x, idx1, idx2):
+    """Compute y such that: y[i, j] = x[i, idx1[i,j], idx2[i,j]]
+    https://discuss.pytorch.org/t/similar-to-torch-gather-over-two-dimensions/118827/3
+    x: N x B x V
+        idx1: N x K matrix where idx1[i, j] is between [0, B)
+        idx2: N x K matrix where idx2[i, j] is between [0, V)
+    Return:
+        y: N x K matrix where y[i, j] = x[i, idx1[i,j], idx2[i,j]]
+    """
+    # Linearize the last two dims and index in a contiguous x
+    x = x.contiguous()
+
+    lin_idx = idx2 + x.size(-1) * idx1
+    x = x.view(-1, x.size(1) * x.size(2))
+
+    return x.gather(-1, lin_idx)
+
+
+class DualBeamSearch(Search):
+    def __init__(self, tgt_dict):
+        super().__init__(tgt_dict)
+        self.constraint_states = None
+
+    @torch.jit.export
+    def step(
+        self,
+        step: int,
+        lprobs,
+        scores: Optional[Tensor],
+        prev_output_tokens: Optional[Tensor] = None,
+        original_batch_idxs: Optional[Tensor] = None,
+        weight_score: Optional[float] = 0.5,
+        asr_diverse_width: Optional[int] = 0,
+    ):
+        if isinstance(lprobs, list) or isinstance(lprobs, tuple):
+            lprobs = torch.stack(lprobs)
+        # if isinstance(scores, list) or isinstance(scores, tuple):
+        #     scores = torch.stack(scores)
+        
+        _, bsz, beam_size, vocab_size = lprobs.size()
+
+        # Will select K candidates
+        K = beam_size*2
+        # Main beam size
+        B = beam_size if step > 0 else 1
+
+        if step == 0:
+            # at the first step all hypotheses are equally likely, so use
+            # only the first beam
+            lprobs = lprobs[:, :, 0, :].contiguous() # num_inputs x N x V
+            lprobs = lprobs.unsqueeze(-2) # num_inputs x N x 1 x V
+        else:
+            # make probs contain cumulative scores for each hypothesis
+            assert scores is not None
+            # lprobs = lprobs + scores.view(bsz, beam_size, -1).unsqueeze(0)[:, :, :, step - 1].unsqueeze(-1)
+            lprobs = lprobs + scores.view(2, bsz, beam_size, -1)[:, :, :, step-1].unsqueeze(-1)
+
+        top_predictions = torch.topk(lprobs, k=min(K, vocab_size - 1))
+        
+        # top_predictions[0] is num_inputs x N x B x K
+        # xk: N x B x K, ixk: N x B x K
+        xk = top_predictions[0][0]
+        ixk = top_predictions[1][0]
+        yk = top_predictions[0][1]
+        iyk = top_predictions[1][1]
+        # logging.info(f'xk:\n{xk}')
+        # logging.info(f'ixk:\n{ixk}')
+        # logging.info(f'yk:\n{yk}')
+        # logging.info(f'iyk:\n{iyk}')
+
+        assert xk.shape == (bsz, B, K) and ixk.shape == (bsz, B, K)
+
+        # (N, B, K, K)
+        scores = (weight_score * torch.matmul(xk.unsqueeze(-1), torch.ones_like(xk).unsqueeze(-2)) 
+                + (1 - weight_score) * torch.matmul(torch.ones_like(yk).unsqueeze(-1), yk.unsqueeze(-1).transpose(-1,-2)))
+        if asr_diverse_width > 0:
+            # triangular approach
+            h = asr_diverse_width
+            w = 2 * K // h
+            _m = torch.flip(torch.tril(utils.fill_with_neg_inf(
+                    torch.zeros([h, w])), 1), [1]).unsqueeze(0).unsqueeze(0).to(scores)
+            m = torch.zeros(1, 1, K, K).to(scores)
+            m[:, :, h :, : ] = -math.inf
+            m[:, :, :, w : ] = -math.inf
+            m[:, :, :h, :][:, :, :, :w] += _m
+            scores += m
+
+            # # rectangle approach
+            # h = asr_diverse_width
+            # w = K // h
+            # m = torch.zeros_like(scores) + float("-inf")
+            # m[:, :, :h, :w] = 0.0
+            # scores += m
+
+        # Top k of N x BK^2 tensor
+        # scores: N x K, inds: N x K
+        scores, inds = torch.topk(scores.view(bsz, -1), k=K)
+
+        # Convert back to the indices in the B x B pairwise score matrices
+        # N x K
+        beam_indices = inds // K**2 # 1st index in the B x K x K
+        scoreBB_flatten_indices = inds.fmod(K**2)
+        subbeam1_indices = scoreBB_flatten_indices // K # 2nd index in the B x K x K
+        subbeam2_indices = scoreBB_flatten_indices.fmod(K) # 3rd index in the B x K x K
+
+        # We need to convert the 2nd and 3rd indices above to vocabulary indices
+        subbeam1_vocab_indices = torch.zeros_like(subbeam1_indices)
+        subbeam2_vocab_indices = torch.zeros_like(subbeam2_indices)
+
+        # In the following, we basically do this:
+        # for i in range(bsz):
+        #     for j in range(K):
+        #         subbeam1_vocab_indices[i, j] = ixk[i, beam_indices[i,j], subbeam1_indices[i,j]]
+        #         subbeam2_vocab_indices[i, j] = iyk[i, beam_indices[i,j], subbeam2_indices[i,j]]
+        # This is faster than the above for loop but still not optimal
+        # subbeam1_vocab_indices = torch.einsum('iij->ij', ixk[:,beam_indices,subbeam1_indices])
+        # subbeam2_vocab_indices = torch.einsum('iij->ij', iyk[:,beam_indices,subbeam2_indices])
+        subbeam1_vocab_indices = gather2D(ixk, beam_indices, subbeam1_indices)
+        subbeam2_vocab_indices = gather2D(iyk, beam_indices, subbeam2_indices)
+
+        # scores_buf = scores
+        # scores_buf[0][i, j] = lprobs[0][i, beam_indices[i, j], subbeam1_vocab_indices[i, j]]
+        scores_buf = torch.stack([gather2D(lprobs[0], beam_indices, subbeam1_vocab_indices), 
+                                  gather2D(lprobs[1], beam_indices, subbeam2_vocab_indices)])
+        # logging.info(f'scores_buf: {scores_buf.shape}\n{scores_buf}')
+        indices_buf = torch.stack([subbeam1_vocab_indices, subbeam2_vocab_indices])
+        beams_buf = beam_indices
+
+        # At this point, beams_buf and indices_buf are single-dim and contain relative indices
+        return scores_buf, indices_buf, beams_buf

@@ -210,6 +210,7 @@ class TransformerEncoderBase(FairseqEncoder):
             has_pads = torch.tensor(1) if has_pads else torch.tensor(0)
 
         x, encoder_embedding = self.forward_embedding(src_tokens, token_embeddings)
+        embed_src_tokens = x.transpose(0, 1)
 
         # account for padding while computing the representation
         x = x * (
@@ -263,6 +264,7 @@ class TransformerEncoderBase(FairseqEncoder):
             "fc_results": fc_results,  # List[T x B x C]
             "src_tokens": [],
             "src_lengths": [src_lengths],
+            "embed_src_tokens": [embed_src_tokens], # T x B x C
         }
 
     @torch.jit.export

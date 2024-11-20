@@ -9,6 +9,7 @@ from dataclasses import dataclass, field, fields
 from typing import List, Optional
 
 from omegaconf import II
+from fairseq.utils import safe_getattr, safe_hasattr
 
 from fairseq import utils
 from fairseq.dataclass import ChoiceEnum, FairseqDataclass

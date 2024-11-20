@@ -470,7 +470,7 @@ class RobertaModel(FairseqEncoderModel):
 class RobertaLMHead(nn.Module):
     """Head for masked language modeling."""
 
-    def __init__(self, embed_dim, output_dim, activation_fn, weight=None):
+    def __init__(self, embed_dim, output_dim, activation_fn, weight=None, bias=True):
         super().__init__()
         self.dense = nn.Linear(embed_dim, embed_dim)
         self.activation_fn = utils.get_activation_fn(activation_fn)
@@ -479,7 +479,9 @@ class RobertaLMHead(nn.Module):
         if weight is None:
             weight = nn.Linear(embed_dim, output_dim, bias=False).weight
         self.weight = weight
-        self.bias = nn.Parameter(torch.zeros(output_dim))
+        self.bias = None
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(output_dim))
 
     def forward(self, features, masked_tokens=None, **kwargs):
         # Only project the masked tokens while training,
@@ -491,7 +493,9 @@ class RobertaLMHead(nn.Module):
         x = self.activation_fn(x)
         x = self.layer_norm(x)
         # project back to size of vocabulary with bias
-        x = F.linear(x, self.weight) + self.bias
+        x = F.linear(x, self.weight)
+        if self.bias is not None:
+            x = x + self.bias
         return x
 
 
@@ -675,6 +679,30 @@ def roberta_prenorm_architecture(args):
     args.layernorm_embedding = safe_getattr(args, "layernorm_embedding", False)
     args.encoder_normalize_before = safe_getattr(args, "encoder_normalize_before", True)
     base_architecture(args)
+
+
+@register_model_architecture("roberta", "roberta_for_siamese_st2t_m_enc6")
+def roberta_for_siamese_st2t_m_enc6(args):
+    args.layernorm_embedding = safe_getattr(args, "layernorm_embedding", False)
+    args.encoder_normalize_before = safe_getattr(args, "encoder_normalize_before", True)
+    args.encoder_learned_pos = safe_getattr(args, "encoder_learned_pos", False)
+    args.encoder_layers = safe_getattr(args, "encoder_layers", 6)
+    args.encoder_embed_dim = safe_getattr(args, "encoder_embed_dim", 512)
+    args.encoder_ffn_embed_dim = safe_getattr(args, "encoder_ffn_embed_dim", 2048)
+    args.encoder_attention_heads = safe_getattr(args, "encoder_attention_heads", 8)
+    base_architecture(args)
+
+
+@register_model_architecture("roberta", "roberta_for_siamese_st2t_m_enc8")
+def roberta_for_siamese_st2t_m_enc8(args):
+    args.encoder_layers = safe_getattr(args, "encoder_layers", 8)
+    roberta_for_siamese_st2t_m_enc6(args)
+
+
+@register_model_architecture("roberta", "roberta_for_siamese_st2t_m_enc10")
+def roberta_for_siamese_st2t_m_enc10(args):
+    args.encoder_layers = safe_getattr(args, "encoder_layers", 10)
+    roberta_for_siamese_st2t_m_enc6(args)
 
 
 @register_model_architecture("roberta", "roberta_base")

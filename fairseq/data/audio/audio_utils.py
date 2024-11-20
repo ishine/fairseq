@@ -65,6 +65,13 @@ def convert_waveform(
         return converted, converted_sample_rate
     return waveform, sample_rate
 
+def _convert_to_mono(waveform: np.ndarray, sample_rate: int) -> np.ndarray:
+    if waveform.shape[0] > 1:
+        _waveform = torch.from_numpy(waveform)
+        effects = [["channels", "1"]]
+        return _sox_convert(_waveform, sample_rate, effects).numpy()
+    return waveform
+
 
 def get_waveform(
     path_or_fp: Union[str, BinaryIO],

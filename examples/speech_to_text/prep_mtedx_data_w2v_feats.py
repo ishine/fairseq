@@ -7,6 +7,7 @@
 import argparse
 import logging
 import os
+import numpy as np
 from pathlib import Path
 import shutil
 from itertools import groupby
@@ -15,6 +16,8 @@ from typing import Tuple
 
 import pandas as pd
 import soundfile as sf
+import torch
+import torch.nn.functional as F
 from examples.speech_to_text.data_utils import (
     create_zip,
     extract_fbank_features,
@@ -25,18 +28,17 @@ from examples.speech_to_text.data_utils import (
     load_df_from_tsv,
     save_df_to_tsv,
 )
-import torch
+from fairseq.data.audio.audio_utils import get_waveform
+from torch import Tensor
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-from fairseq.data.audio.audio_utils import get_waveform, convert_waveform
-
+import fairseq
 
 log = logging.getLogger(__name__)
 
 
-MANIFEST_COLUMNS = ["id", "audio", "n_frames", "tgt_text", "speaker", "tgt_lang",
-                    "src_text", "src_lang"]
+MANIFEST_COLUMNS = ["id", "audio", "n_frames", "tgt_text", "speaker", "tgt_lang"]
 
 
 class mTEDx(Dataset):
@@ -46,31 +48,42 @@ class mTEDx(Dataset):
     target utterance, speaker_id, utterance_id
     """
 
-    SPLITS = ["train", "valid", "test"]
-    # LANGPAIRS = ["es-es", "fr-fr", "pt-pt", "it-it", "ru-ru", "el-el", "ar-ar", "de-de",
-    #              "es-en", "es-fr", "es-pt", "es-it", "fr-en", "fr-es", "fr-pt",
-    #              "pt-en", "pt-es", "it-en", "it-es", "ru-en", "el-en"]
-    LANGPAIRS = ["es-es", "fr-fr", "pt-pt", "it-it",
-                 "es-en", "es-fr", "es-pt", "es-it", 
-                 "fr-en", "fr-es", "fr-pt",
-                 "pt-en"] # IWSLT pairs
+    SPLITS    = ["train", "valid", "test"] #, "iwslt2021"]
+    LANGPAIRS = ["es-es","fr-fr","pt-pt","it-it","ru-ru","el-el","ar-ar","de-de",
+                 "es-en","es-fr","es-pt","es-it","fr-en","fr-es","fr-pt",
+                 "pt-en","pt-es","it-en","it-es","ru-en","el-en"]
 
-    def __init__(self, root: str, lang: str, split: str) -> None:
+
+    def __init__(self, root: str, lang: str, split: str,
+                use_w2v_feats: bool = False,
+                w2v_path: str = None,
+                use_gpu: bool = True,
+                normalize_signal: bool = False,
+                ) -> None:
         assert split in self.SPLITS and lang in self.LANGPAIRS
         _root = Path(root) / f"{lang}" / "data" / split
         wav_root, txt_root = _root / "wav", _root / "txt"
         assert _root.is_dir() and wav_root.is_dir() and txt_root.is_dir()
+        self.use_w2v_feats = use_w2v_feats
+        self.gpu = torch.cuda.current_device() if use_gpu else None
+        self.normalize_signal = normalize_signal
+        if self.use_w2v_feats:
+            assert os.path.isfile(w2v_path), f"{w2v_path} does not exist."
+            print(f'Loading model from {w2v_path}...')
+            w2v_model, _ , _ = fairseq.checkpoint_utils.load_model_ensemble_and_task([w2v_path])
+            w2v_model = w2v_model[0]
+            w2v_model.eval()
+            self.w2v_model = w2v_model.cuda(self.gpu) if self.gpu is not None else w2v_model
+
         # Load audio segments
         try:
             import yaml
         except ImportError:
-            print(
-                "Please install PyYAML to load the Multilingual TEDx YAML files"
-            )
+            print("Please install PyYAML to load the Multilingual TEDx YAML files")
         with open(txt_root / f"{split}.yaml") as f:
             segments = yaml.load(f, Loader=yaml.BaseLoader)
         # Load source and target utterances
-        src, tgt = lang.split("-")
+        src,tgt = lang.split("-")
         for _lang in [src, tgt]:
             with open(txt_root / f"{split}.{_lang}") as f:
                 utterances = [r.strip() for r in f]
@@ -80,7 +93,6 @@ class mTEDx(Dataset):
         # Gather info
         self.data = []
         for wav_filename, _seg_group in groupby(segments, lambda x: x["wav"]):
-            wav_filename = wav_filename.replace(".wav", ".flac")
             wav_path = wav_root / wav_filename
             sample_rate = sf.info(wav_path.as_posix()).samplerate
             seg_group = sorted(_seg_group, key=lambda x: float(x["offset"]))
@@ -99,15 +111,22 @@ class mTEDx(Dataset):
                         segment["speaker_id"],
                         tgt,
                         _id,
-                        src,
                     )
                 )
 
-    def __getitem__(self, n: int) -> Tuple[torch.Tensor, int, str, str, str, str, str]:
-        wav_path, offset, n_frames, sr, src_utt, tgt_utt, spk_id, tgt_lang, utt_id, src_lang = self.data[n]
-        waveform, _ = get_waveform(wav_path, frames=n_frames, start=offset)
+    def __getitem__(self, n: int) -> Tuple[Tensor, int, str, str, str, str, str]:
+        wav_path, offset, n_frames, sr, src_utt, tgt_utt, spk_id, tgt_lang, utt_id = self.data[n]
+        waveform, _ = get_waveform(wav_path, frames=n_frames, start=offset) # 1 x T
         waveform = torch.from_numpy(waveform)
-        return waveform, sr, src_utt, tgt_utt, spk_id, tgt_lang, utt_id, src_lang
+        feats = None
+        if self.use_w2v_feats:
+            waveform = waveform.cuda(self.gpu) if self.gpu is not None else waveform
+            with torch.no_grad():
+                if self.normalize_signal:
+                    waveform = F.layer_norm(waveform, waveform.shape)
+                feats = self.w2v_model(waveform, mask=False, features_only=True)["x"] # 1 x T x D_w2v
+                feats = feats.squeeze(0).cpu().numpy()
+        return waveform, feats, sr, src_utt, tgt_utt, spk_id, tgt_lang, utt_id
 
     def __len__(self) -> int:
         return len(self.data)
@@ -121,57 +140,52 @@ def process(args):
             print(f"{cur_root.as_posix()} does not exist. Skipped.")
             continue
         # Extract features
-        audio_root = cur_root / ("flac" if args.use_audio_input else "fbank80")
-        audio_root.mkdir(exist_ok=True)
+        feature_root = cur_root / "fbank80" if not args.use_w2v_feats else cur_root / "w2v2_feats"
+        feature_root.mkdir(exist_ok=True)
         for split in mTEDx.SPLITS:
             print(f"Fetching split {split}...")
-            dataset = mTEDx(root.as_posix(), lang, split)
-            if args.use_audio_input:
-                print("Converting audios...")
-                for waveform, sample_rate, _, _, _, utt_id in tqdm(dataset):
-                    tgt_sample_rate = 16_000
-                    _wavform, _ = convert_waveform(
-                        waveform, sample_rate, to_mono=True,
-                        to_sample_rate=tgt_sample_rate
-                    )
-                    sf.write(
-                        (audio_root / f"{utt_id}.flac").as_posix(),
-                        _wavform.numpy(), tgt_sample_rate
+            dataset = mTEDx(root.as_posix(), lang, split,
+                            use_w2v_feats=args.use_w2v_feats,
+                            w2v_path=args.w2v_path,
+                            use_gpu=args.use_gpu,
+                            normalize_signal=args.normalize_signal)
+            print("Extracting log mel filter bank or wav2vec features...")
+            if not args.use_w2v_feats:
+                for waveform, _, sample_rate, _, _, _, _, utt_id in tqdm(dataset):
+                    extract_fbank_features(
+                        waveform, sample_rate, feature_root / f"{utt_id}.npy"
                     )
             else:
-                print("Extracting log mel filter bank features...")
-                for waveform, sample_rate, _, _, _, _, utt_id in tqdm(dataset):
-                    extract_fbank_features(
-                        waveform, sample_rate, audio_root / f"{utt_id}.npy"
-                    )
+                for _, features, sample_rate, _, _, _, _, utt_id in tqdm(dataset):
+                    output_path = feature_root / f"{utt_id}.npy"
+                    np.save(output_path.as_posix(), features)
         # Pack features into ZIP
-        zip_path = cur_root / f"{audio_root.name}.zip"
-        print("ZIPing audios/features...")
-        create_zip(audio_root, zip_path)
+        zip_path = cur_root / "fbank80.zip" if not args.use_w2v_feats else cur_root / "w2v2_feats.zip"
+        print("ZIPing features...")
+        create_zip(feature_root, zip_path)
         print("Fetching ZIP manifest...")
-        audio_paths, audio_lengths = get_zip_manifest(zip_path)
+        zip_manifest = get_zip_manifest(zip_path)
         # Generate TSV manifest
         print("Generating manifest...")
         train_text = []
         for split in mTEDx.SPLITS:
             is_train_split = split.startswith("train")
             manifest = {c: [] for c in MANIFEST_COLUMNS}
-            dataset = mTEDx(args.data_root, lang, split)
-            for wav, sr, src_utt, tgt_utt, speaker_id, tgt_lang, utt_id, src_lang in tqdm(dataset):
+            dataset = mTEDx(root.as_posix(), lang, split,
+                            use_w2v_feats=args.use_w2v_feats,
+                            w2v_path=args.w2v_path,
+                            use_gpu=args.use_gpu,
+                            normalize_signal=args.normalize_signal)
+            for wav, _, sr, src_utt, tgt_utt, speaker_id, tgt_lang, utt_id in tqdm(dataset):
                 manifest["id"].append(utt_id)
-                manifest["audio"].append(audio_paths[utt_id])
-                manifest["n_frames"].append(audio_lengths[utt_id])
-                manifest["tgt_text"].append(
-                    src_utt if args.task == "asr" else tgt_utt
-                )
-                manifest["speaker"].append(spk_id)
+                manifest["audio"].append(zip_manifest[utt_id])
+                duration_ms = int(wav.size(1) / sr * 1000)
+                manifest["n_frames"].append(int(1 + (duration_ms - 25) / 10))
+                manifest["tgt_text"].append(src_utt if args.task == "asr" else tgt_utt)
+                manifest["speaker"].append(speaker_id)
                 manifest["tgt_lang"].append(tgt_lang)
-                manifest["src_text"].append(src_utt)
-                manifest["src_lang"].append(src_lang)
             if is_train_split:
                 train_text.extend(manifest["tgt_text"])
-                if args.joint_asr_dict:
-                    train_text.extend(manifest["src_text"])
             df = pd.DataFrame.from_dict(manifest)
             df = filter_manifest_df(df, is_train_split=is_train_split)
             save_df_to_tsv(df, cur_root / f"{split}_{args.task}.tsv")
@@ -188,23 +202,14 @@ def process(args):
                 args.vocab_size,
             )
         # Generate config YAML
-        if args.use_audio_input:
-            gen_config_yaml(
-                cur_root,
-                spm_filename=spm_filename_prefix + ".model",
-                yaml_filename=f"config_{args.task}.yaml",
-                specaugment_policy=None,
-                extra={"use_audio_input": True}
-            )
-        else:
-            gen_config_yaml(
-                cur_root,
-                spm_filename=spm_filename_prefix + ".model",
-                yaml_filename=f"config_{args.task}.yaml",
-                specaugment_policy="lb",
-            )
+        gen_config_yaml(
+            cur_root,
+            spm_filename_prefix + ".model",
+            yaml_filename=f"config_{args.task}.yaml",
+            specaugment_policy="lb",
+        )
         # Clean up
-        shutil.rmtree(audio_root)
+        shutil.rmtree(feature_root)
 
 
 def process_joint(args):
@@ -213,23 +218,16 @@ def process_joint(args):
         "do not have downloaded data available for all languages"
     # Generate vocab
     vocab_size_str = "" if args.vocab_type == "char" else str(args.vocab_size)
-    spm_filename_prefix = f"spm_{args.vocab_type}{vocab_size_str}_{args.task}{args.joint_suffix}"
+    spm_filename_prefix = f"spm_{args.vocab_type}{vocab_size_str}_{args.task}"
     with NamedTemporaryFile(mode="w") as f:
         for lang in mTEDx.LANGPAIRS:
             tsv_path = cur_root / f"{lang}" / f"train_{args.task}.tsv"
             df = load_df_from_tsv(tsv_path)
             for t in df["tgt_text"]:
                 f.write(t + "\n")
-            if args.joint_asr_dict:
-                for t in df["src_text"]:
-                    f.write(t + "\n")
         special_symbols = None
         if args.joint:
-            if not args.joint_asr_dict:
-                # Add tgt_lang tags to dict
-                special_symbols = list({f'<lang:{lang.split("-")[1]}>' for lang in mTEDx.LANGPAIRS})
-            else:
-                special_symbols = list({f'<lang:{lang.split("-")[i]}>' for i in range(2) for lang in mTEDx.LANGPAIRS})
+            special_symbols = list(set([f'<lang:{lang.split("-")[1]}>' for lang in mTEDx.LANGPAIRS]))  #add tgt_lang tags to dict
         gen_vocab(
             Path(f.name),
             cur_root / spm_filename_prefix,
@@ -241,7 +239,7 @@ def process_joint(args):
     gen_config_yaml(
         cur_root,
         spm_filename_prefix + ".model",
-        yaml_filename=f"config_{args.task}{args.joint_suffix}.yaml",
+        yaml_filename=f"config_{args.task}.yaml",
         specaugment_policy="ld",
         prepend_tgt_lang_tag=(args.joint),
     )
@@ -249,7 +247,7 @@ def process_joint(args):
     for lang in mTEDx.LANGPAIRS:
         for split in mTEDx.SPLITS:
             src_path = cur_root / f"{lang}" / f"{split}_{args.task}.tsv"
-            desc_path = cur_root / f"{split}_{lang}_{args.task}{args.joint_suffix}.tsv"
+            desc_path = cur_root / f"{split}_{lang}_{args.task}.tsv"
             if not desc_path.is_symlink():
                 os.symlink(src_path, desc_path)
 
@@ -267,9 +265,10 @@ def main():
     parser.add_argument("--vocab-size", default=8000, type=int)
     parser.add_argument("--task", type=str, choices=["asr", "st"])
     parser.add_argument("--joint", action="store_true", help="")
-    parser.add_argument("--use-audio-input", action="store_true")
-    parser.add_argument("--joint-asr-dict", action="store_true", help="")
-    parser.add_argument("--joint-suffix", type=str, default="")
+    parser.add_argument("--use-w2v-feats", action="store_true")
+    parser.add_argument("--w2v-path", type=str)
+    parser.add_argument("--use-gpu", action="store_true")
+    parser.add_argument("--normalize-signal", action="store_true")
     args = parser.parse_args()
 
     if args.joint:

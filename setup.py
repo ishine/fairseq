@@ -11,6 +11,10 @@ import sys
 from setuptools import Extension, find_packages, setup
 from torch.utils import cpp_extension
 
+### PEP517 workaround
+import site
+site.ENABLE_USER_SITE = True
+
 if sys.version_info < (3, 6):
     sys.exit("Sorry, Python >= 3.6 is required for fairseq.")
 

@@ -12,11 +12,13 @@ import logging
 import math
 import os
 import sys
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Dict, Optional, Any, List, Tuple, Callable
+import clonefuse as cf
+# from clonefuse import Block
 
 # We need to setup root logger before importing any fairseq libraries.
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(name)s | %(filename)s:%(lineno)d | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     level=os.environ.get("LOGLEVEL", "INFO").upper(),
     stream=sys.stdout,
@@ -94,6 +96,21 @@ def main(cfg: FairseqConfig) -> None:
             model = fsdp_wrap(task.build_model(cfg.model))
     else:
         model = task.build_model(cfg.model)
+    if cfg.common.clonefuse > 1:
+        logger.info(f"***** CLONE FUSING *****")
+        if cfg.common.clone_type == 'linear':
+            clonable_types = [torch.nn.Linear, torch.nn.modules.conv._ConvNd]
+        elif cfg.common.clone_type == 'block':
+            clonable_types = [Block]
+        elif cfg.common.clone_type == 'both':
+            clonable_types = [torch.nn.Linear, torch.nn.modules.conv._ConvNd, Block]
+        else:
+            raise NotImplementedError
+        model, param_map = cf.clone(model, clone_first=cfg.common.clone_first, clone_last=cfg.common.clone_last, 
+                                num_clones=cfg.common.clonefuse, clonable_types=clonable_types, sync_processes=True)
+        # if distributed:
+        #     ddp_find_unused_parameters = True
+
     criterion = task.build_criterion(cfg.criterion)
     logger.info(model)
     logger.info("task: {}".format(task.__class__.__name__))
@@ -208,6 +225,26 @@ def main(cfg: FairseqConfig) -> None:
 
         # only use first validation loss to update the learning rate
         lr = trainer.lr_step(epoch_itr.epoch, valid_losses[0])
+
+        # Get Wasserstein position cost
+        if hasattr(criterion, "wass_pos_cost"):
+            if getattr(criterion, "wass_pos_epoch", 0) > 0:
+                p = -(criterion.wass_pos_cost / criterion.wass_pos_epoch) * epoch_itr.epoch \
+                    + criterion.wass_pos_cost
+                criterion.wass_pos_cost_val = max(p, 0)
+
+        # # Get CTC weight
+        # if hasattr(criterion, "ctc_zero_epoch"):
+        #     assert hasattr(criterion, "ctc_warmup_epoch")
+        #     s = criterion.ctc_zero_epoch
+        #     t = criterion.ctc_warmup_epoch
+        #     m = criterion.ctc_weight
+        #     if epoch_itr.epoch < s:
+        #         criterion.ctc_weight_val = 0.0
+        #     elif  s <= epoch_itr.epoch <= s + t:
+        #         criterion.ctc_weight_val = (m/t) * epoch_itr.epoch - (m*s/t)
+        #     else:
+        #         criterion.ctc_weight_val = m
 
         epoch_itr = trainer.get_train_iterator(
             epoch_itr.next_epoch_idx,

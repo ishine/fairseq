@@ -3,6 +3,7 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 import math
 from typing import Dict, List, Optional, Tuple
 
@@ -478,6 +479,7 @@ class MultiheadAttention(FairseqIncrementalDecoder):
         attn_mask: Optional[Tensor] = None,
         before_softmax: bool = False,
         need_head_weights: bool = False,
+        wait_k: bool = False,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Input shape: Time x Batch x Channel
 
@@ -514,51 +516,39 @@ class MultiheadAttention(FairseqIncrementalDecoder):
                 assert value is not None
                 assert src_len, key_bsz == value.shape[:2]
 
-        if (
-            not self.onnx_trace
-            and not is_tpu  # don't use PyTorch version on TPUs
-            and incremental_state is None
-            and not static_kv
-            # A workaround for quantization to work. Otherwise JIT compilation
-            # treats bias in linear module as method.
-            and not torch.jit.is_scripting()
-            # The Multihead attention implemented in pytorch forces strong dimension check
-            # for input embedding dimention and K,Q,V projection dimension.
-            # Since pruning will break the dimension check and it is not easy to modify the pytorch API,
-            # it is preferred to bypass the pytorch MHA when we need to skip embed_dim_check
-            and not self.skip_embed_dim_check
-        ):
-            assert key is not None and value is not None
-
-            if self.use_xformers:
-                return self._xformers_attn_forward(
-                    query, key, value, key_padding_mask, need_weights, attn_mask
-                )
-
-            else:
-                return F.multi_head_attention_forward(
-                    query,
-                    key,
-                    value,
-                    self.embed_dim,
-                    self.num_heads,
-                    torch.empty([0]),
-                    torch.cat((self.q_proj.bias, self.k_proj.bias, self.v_proj.bias)),
-                    self.bias_k,
-                    self.bias_v,
-                    self.add_zero_attn,
-                    self.dropout_module.p,
-                    self.out_proj.weight,
-                    self.out_proj.bias,
-                    self.training or self.dropout_module.apply_during_inference,
-                    key_padding_mask.bool() if key_padding_mask is not None else None,
-                    need_weights,
-                    attn_mask,
-                    use_separate_proj_weight=True,
-                    q_proj_weight=self.q_proj.weight,
-                    k_proj_weight=self.k_proj.weight,
-                    v_proj_weight=self.v_proj.weight,
-                )
+        # if (
+        #     not self.onnx_trace
+        #     and not is_tpu  # don't use PyTorch version on TPUs
+        #     and incremental_state is None
+        #     and not static_kv
+        #     # A workaround for quantization to work. Otherwise JIT compilation
+        #     # treats bias in linear module as method.
+        #     and not torch.jit.is_scripting()
+        # ):
+        #     assert key is not None and value is not None
+        #     return F.multi_head_attention_forward(
+        #         query,
+        #         key,
+        #         value,
+        #         self.embed_dim,
+        #         self.num_heads,
+        #         torch.empty([0]),
+        #         torch.cat((self.q_proj.bias, self.k_proj.bias, self.v_proj.bias)),
+        #         self.bias_k,
+        #         self.bias_v,
+        #         self.add_zero_attn,
+        #         self.dropout_module.p,
+        #         self.out_proj.weight,
+        #         self.out_proj.bias,
+        #         self.training or self.dropout_module.apply_during_inference,
+        #         key_padding_mask,
+        #         need_weights,
+        #         attn_mask,
+        #         use_separate_proj_weight=True,
+        #         q_proj_weight=self.q_proj.weight,
+        #         k_proj_weight=self.k_proj.weight,
+        #         v_proj_weight=self.v_proj.weight,
+        #     )
 
         if incremental_state is not None:
             saved_state = self._get_input_buffer(incremental_state)
@@ -733,9 +723,17 @@ class MultiheadAttention(FairseqIncrementalDecoder):
         if before_softmax:
             return attn_weights, v
 
+        # If an entire row of attn_weights is -inf, then
+        not_attn_mask = torch.isinf(attn_weights)
+        # Non-attendable rows
+        rows_no_attend = torch.all(not_attn_mask, dim=-1)
+        rows_no_attend = rows_no_attend.unsqueeze(-1).repeat(1, 1, attn_weights.shape[-1])
+        attn_weights[rows_no_attend] = 0     
         attn_weights_float = utils.softmax(
             attn_weights, dim=-1, onnx_trace=self.onnx_trace
         )
+        # Reset non-attendable rows to 0
+        attn_weights_float = attn_weights_float.masked_fill(not_attn_mask, 0.0)
         attn_weights = attn_weights_float.type_as(attn_weights)
         attn_probs = self.dropout_module(attn_weights)
 

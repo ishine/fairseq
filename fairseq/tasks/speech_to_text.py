@@ -53,6 +53,16 @@ class SpeechToTextTask(LegacyFairseqTask):
             metavar="N",
             help="max number of tokens in the target sequence",
         )
+        parser.add_argument(
+            "--subtasks", 
+            default=None,
+            type=str, 
+            metavar='STR', 
+            help="List of subtasks separated by _")
+        parser.add_argument(
+            '--homogeneous-batch', 
+            action='store_true',
+            help='Use homogeneous batch in training and evaluation.')
 
     def __init__(self, args, tgt_dict):
         super().__init__(args)
@@ -134,6 +144,7 @@ class SpeechToTextTask(LegacyFairseqTask):
         is_train_split = split.startswith("train")
         pre_tokenizer = self.build_tokenizer(self.args)
         bpe_tokenizer = self.build_bpe(self.args)
+        logging.info(f"self.args.subtasks: {self.args.subtasks}")
         self.datasets[split] = SpeechToTextDatasetCreator.from_tsv(
             root=self.args.data,
             cfg=self.data_cfg,
@@ -146,6 +157,7 @@ class SpeechToTextTask(LegacyFairseqTask):
             seed=self.args.seed,
             speaker_to_id=self.speaker_to_id,
             multitask=self.multitask_tasks,
+            subtasks=self.args.subtasks,
         )
 
     @property
@@ -231,15 +243,11 @@ class SpeechToTextTask(LegacyFairseqTask):
             for s, i in self.tgt_dict.indices.items()
             if SpeechToTextDataset.is_lang_tag(s)
         }
-
-        if extra_gen_cls_kwargs is None:
-            extra_gen_cls_kwargs = {}
-        extra_gen_cls_kwargs["symbols_to_strip_from_output"] = lang_token_ids
-
-        eos_token = (
-            args.eos_token
-            if "eos_token" in args and args.eos_token is not None
-            else self.data_cfg.config.get("eos_token", None)
+        lang_token_ids.add(self.tgt_dict.pad()) # remove padding
+        logging.info(f'symbols_to_strip_from_output: {lang_token_ids}')
+        extra_gen_cls_kwargs = {"symbols_to_strip_from_output": lang_token_ids}
+        return super().build_generator(
+            models, args, seq_gen_cls=None, extra_gen_cls_kwargs=extra_gen_cls_kwargs
         )
 
         if self.data_cfg.prepend_bos_and_append_tgt_lang_tag and not eos_token:

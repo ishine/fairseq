@@ -415,6 +415,17 @@ class FairseqTask(object):
             SequenceGenerator,
             SequenceGeneratorWithAlignment,
         )
+        try:
+            from fairseq.fb_sequence_generator import FBSequenceGenerator
+        except ModuleNotFoundError:
+            pass
+        try:
+            from fairseq.sequence_generator_dd import (
+                SequenceGeneratorIndependent,
+                SequenceGeneratorDualBeam,
+            )
+        except ModuleNotFoundError:
+            pass
 
         # Choose search strategy. Defaults to Beam Search.
         sampling = getattr(args, "sampling", False)
@@ -482,6 +493,18 @@ class FairseqTask(object):
             if getattr(args, "print_alignment", False):
                 seq_gen_cls = SequenceGeneratorWithAlignment
                 extra_gen_cls_kwargs["print_alignment"] = args.print_alignment
+            elif getattr(args, "fb_seq_gen", False):
+                seq_gen_cls = FBSequenceGenerator
+            elif getattr(args, "independent_beams", False):
+                seq_gen_cls = SequenceGeneratorIndependent
+                search_strategy = search.DualBeamSearch_independent(self.target_dictionary)
+            elif getattr(args, "dual_beams", False):
+                seq_gen_cls = SequenceGeneratorDualBeam
+                search_strategy = search.DualBeamSearch(self.target_dictionary)
+                extra_gen_cls_kwargs["waitk"] = getattr(args, "waitk", 0)
+                extra_gen_cls_kwargs["waitk_ensemble"] = getattr(args, "waitk_ensemble", False)
+                extra_gen_cls_kwargs["weight_score"] = getattr(args, "weight_score", 0.5)
+                extra_gen_cls_kwargs["asr_diverse_width"] = getattr(args, "asr_diverse_width", 0)
             else:
                 seq_gen_cls = SequenceGenerator
 

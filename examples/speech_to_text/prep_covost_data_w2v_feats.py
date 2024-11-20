@@ -6,12 +6,17 @@
 
 import argparse
 import logging
+import os
+import numpy as np
 from pathlib import Path
 import shutil
+import soundfile as sf
 from tempfile import NamedTemporaryFile
 from typing import Optional, Tuple
 
 import pandas as pd
+import torch
+import torch.nn.functional as F
 import torchaudio
 from examples.speech_to_text.data_utils import (
     create_zip,
@@ -28,12 +33,13 @@ from torch.utils.data import Dataset
 from torchaudio.datasets.utils import download_url, extract_archive
 from tqdm import tqdm
 
+import fairseq
+
 
 log = logging.getLogger(__name__)
 
 
-MANIFEST_COLUMNS = ["id", "audio", "n_frames", "tgt_text", "speaker", 
-                    "src_text", "src_lang", "tgt_lang"]
+MANIFEST_COLUMNS = ["id", "audio", "n_frames", "tgt_text", "speaker"]
 
 
 class CoVoST(Dataset):
@@ -111,10 +117,28 @@ class CoVoST(Dataset):
         source_language: str,
         target_language: Optional[str] = None,
         version: int = 2,
+        use_w2v_feats: bool = False,
+        w2v_path: str = None,
+        gpu: int = 0,
+        normalize_signal: bool = False,
+        w2v_version: int = 2,
     ) -> None:
         assert version in self.VERSIONS and split in self.SPLITS
         assert source_language is not None
         self.no_translation = target_language is None
+        self.use_w2v_feats = use_w2v_feats
+        self.folder_name = "clips"
+        self.gpu = torch.cuda.current_device()
+        self.normalize_signal = normalize_signal
+        self.w2v_version = w2v_version
+        print(f'*** normalize_signal: {normalize_signal} ***')
+        if self.use_w2v_feats:
+            assert os.path.isfile(w2v_path), f"{w2v_path} does not exist."
+            print(f'Loading w2v model from {w2v_path}...')
+            w2v_model, _ , _ = fairseq.checkpoint_utils.load_model_ensemble_and_task([w2v_path])
+            w2v_model = w2v_model[0]
+            w2v_model.eval()
+            self.w2v_model = w2v_model.cuda(self.gpu)
         if not self.no_translation:
             assert "en" in {source_language, target_language}
             if source_language == "en":
@@ -159,7 +183,7 @@ class CoVoST(Dataset):
         self.data = []
         for e in data:
             try:
-                path = self.root / "clips" / e["path"]
+                path = self.root / self.folder_name / e["path"]
                 _ = torchaudio.info(path.as_posix())
                 self.data.append(e)
             except RuntimeError:
@@ -178,13 +202,26 @@ class CoVoST(Dataset):
             sample_id)``
         """
         data = self.data[n]
-        path = self.root / "clips" / data["path"]
-        waveform, sample_rate = torchaudio.load(path)
+        path = self.root / self.folder_name / data["path"]
+        wav, sample_rate = torchaudio.load(path)
+        feats = None
+        if self.use_w2v_feats:
+            wav = wav.cuda(self.gpu)
+            with torch.no_grad():
+                if self.normalize_signal:
+                    wav = F.layer_norm(wav, wav.shape)
+                if self.w2v_version == 2:
+                    feats = self.w2v_model(wav, mask=False, features_only=True)["x"] # 1 x T x D_w2v
+                elif self.w2v_version == 1:
+                    feats = self.w2v_model.feature_extractor(wav)
+                    feats = self.w2v_model.feature_aggregator(feats) # 1 x D_w2v x T
+                    feats = feats.transpose(1,2) 
+                feats = feats.squeeze().cpu().detach().numpy() # T x D_w2v
         sentence = data["sentence"]
         translation = None if self.no_translation else data["translation"]
         speaker_id = data["client_id"]
         _id = data["path"].replace(".mp3", "")
-        return waveform, sample_rate, sentence, translation, speaker_id, _id
+        return wav, feats, sample_rate, sentence, translation, speaker_id, _id
 
     def __len__(self) -> int:
         return len(self.data)
@@ -195,25 +232,34 @@ def process(args):
     if not root.is_dir():
         raise NotADirectoryError(f"{root} does not exist")
     # Extract features
-    feature_root_name = (
-        "fbank80" if args.tgt_lang is None else f"fbank80_{args.src_lang}2{args.tgt_lang}"
-    )
-    feature_root = root / feature_root_name
+    feat_name = "w2v2_feats" if args.use_w2v_feats else "fbank80"
+    feature_root = root / feat_name
     feature_root.mkdir(exist_ok=True)
     for split in CoVoST.SPLITS:
         print(f"Fetching split {split}...")
-        dataset = CoVoST(root, split, args.src_lang, args.tgt_lang)
-        print("Extracting log mel filter bank features...")
-        for waveform, sample_rate, _, _, _, utt_id in tqdm(dataset):
-            extract_fbank_features(
-                waveform, sample_rate, feature_root / f"{utt_id}.npy"
-            )
+        dataset = CoVoST(root, split, args.src_lang, args.tgt_lang,
+                        use_w2v_feats=args.use_w2v_feats,
+                        w2v_path=args.w2v_path,
+                        gpu=args.gpu,
+                        normalize_signal=args.normalize_signal,
+                        w2v_version=args.w2v_version,
+                        )
+        print("Extracting log mel filter bank or wav2vec features...")
+        if not args.use_w2v_feats:
+            for waveform, _, sample_rate, _, _, _, utt_id in tqdm(dataset):
+                extract_fbank_features(
+                    waveform, sample_rate, feature_root / f"{utt_id}.npy"
+                ) # T x n_mel_bins
+        else:
+            for _, features, sample_rate, _, _, _, utt_id in tqdm(dataset):
+                output_path = feature_root / f"{utt_id}.npy"
+                np.save(output_path.as_posix(), features)
     # Pack features into ZIP
-    zip_path = root / f"{feature_root_name}.zip"
+    zip_path = root / f"{feat_name}.zip"
     print("ZIPing features...")
     create_zip(feature_root, zip_path)
     print("Fetching ZIP manifest...")
-    audio_paths, audio_lengths = get_zip_manifest(zip_path)
+    zip_manifest = get_zip_manifest(zip_path)
     # Generate TSV manifest
     print("Generating manifest...")
     train_text = []
@@ -222,16 +268,20 @@ def process(args):
         task = f"st_{args.src_lang}_{args.tgt_lang}"
     for split in CoVoST.SPLITS:
         manifest = {c: [] for c in MANIFEST_COLUMNS}
-        dataset = CoVoST(root, split, args.src_lang, args.tgt_lang)
-        for _, _, src_utt, tgt_utt, speaker_id, utt_id in tqdm(dataset):
+        dataset = CoVoST(root, split, args.src_lang, args.tgt_lang,
+                        use_w2v_feats=args.use_w2v_feats,
+                        w2v_path=args.w2v_path,
+                        gpu=args.gpu,
+                        normalize_signal=args.normalize_signal,
+                        w2v_version=args.w2v_version,
+                        )
+        for wav, feats, sr, src_utt, tgt_utt, speaker_id, utt_id in tqdm(dataset):
             manifest["id"].append(utt_id)
-            manifest["audio"].append(audio_paths[utt_id])
-            manifest["n_frames"].append(audio_lengths[utt_id])
-            manifest["src_text"].append(src_utt)
+            manifest["audio"].append(zip_manifest[utt_id])
+            duration_ms = int(wav.size(1) / sr * 1000)
+            manifest["n_frames"].append(int(1 + (duration_ms - 25) / 10))
             manifest["tgt_text"].append(src_utt if args.tgt_lang is None else tgt_utt)
             manifest["speaker"].append(speaker_id)
-            manifest["src_lang"].append(args.src_lang)
-            manifest["tgt_lang"].append(args.src_lang if args.tgt_lang is None else args.tgt_lang)
         is_train_split = split.startswith("train")
         if is_train_split:
             train_text.extend(manifest["tgt_text"])
@@ -253,7 +303,7 @@ def process(args):
     # Generate config YAML
     gen_config_yaml(
         root,
-        spm_filename=spm_filename_prefix + ".model",
+        spm_filename_prefix + ".model",
         yaml_filename=f"config_{task}.yaml",
         specaugment_policy="lb",
     )
@@ -277,6 +327,11 @@ def main():
     parser.add_argument("--vocab-size", default=1000, type=int)
     parser.add_argument("--src-lang", "-s", required=True, type=str)
     parser.add_argument("--tgt-lang", "-t", type=str)
+    parser.add_argument("--use-w2v-feats", action="store_true")
+    parser.add_argument("--w2v-version", type=int, default=2)
+    parser.add_argument("--normalize-signal", action="store_true")
+    parser.add_argument("--w2v-path", type=str)
+    parser.add_argument("--gpu", type=int, default=0)
     args = parser.parse_args()
 
     process(args)

@@ -36,6 +36,58 @@ from fairseq.modules import (
 logger = logging.getLogger(__name__)
 
 
+class Conv1dSubsampler(nn.Module):
+    """Convolutional subsampler: a stack of 1D convolution (along temporal
+    dimension) followed by non-linear activation via gated linear units
+    (https://arxiv.org/abs/1911.08460)
+
+    Args:
+        in_channels (int): the number of input channels
+        mid_channels (int): the number of intermediate channels
+        out_channels (int): the number of output channels
+        kernel_sizes (List[int]): the kernel size for each convolutional layer
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        mid_channels: int,
+        out_channels: int,
+        kernel_sizes: List[int] = (3, 3),
+        stride: int = 2,
+    ):
+        super(Conv1dSubsampler, self).__init__()
+        self.n_layers = len(kernel_sizes)
+        self.stride = stride
+        self.conv_layers = nn.ModuleList(
+            nn.Conv1d(
+                in_channels if i == 0 else mid_channels // 2,
+                mid_channels if i < self.n_layers - 1 else out_channels * 2,
+                k,
+                stride=stride,
+                padding=k // 2,
+            )
+            for i, k in enumerate(kernel_sizes)
+        )
+
+    def get_out_seq_lens_tensor(self, in_seq_lens_tensor):
+        out = in_seq_lens_tensor.clone()
+        for _ in range(self.n_layers):
+            # out = ((out.float() - 1) / 2 + 1).floor().long()
+            out = ((out.float() - 1) / self.stride + 1).floor().long()
+        return out
+
+    def forward(self, src_tokens, src_lengths):
+        bsz, in_seq_len, _ = src_tokens.size()  # B x T x (C x D)
+        x = src_tokens.transpose(1, 2).contiguous()  # -> B x (C x D) x T
+        for conv in self.conv_layers:
+            x = conv(x)
+            x = nn.functional.glu(x, dim=1)
+        _, _, out_seq_len = x.size()
+        x = x.transpose(1, 2).transpose(0, 1).contiguous()  # -> T x B x (C x D)
+        return x, self.get_out_seq_lens_tensor(src_lengths)
+
+
 @register_model("s2t_transformer")
 class S2TTransformerModel(FairseqEncoderDecoderModel):
     """Adapted Transformer model (https://arxiv.org/abs/1706.03762) for
@@ -210,6 +262,35 @@ class S2TTransformerModel(FairseqEncoderDecoderModel):
             metavar="N",
             help="freeze encoder for first N updates",
         )
+        parser.add_argument(
+            "--use-linear-before-cnn",
+            action="store_true",
+            help="if True, add one linear layer before CNN.",
+        )
+        parser.add_argument(
+            "--no-cnn",
+            action="store_true",
+            help="if True, dont use CNN",
+        )
+        parser.add_argument(
+            "--conv-stride",
+            type=int,
+            metavar="N",
+            default=2,
+            help="# of channels in Conv1d subsampling layers",
+        )
+        parser.add_argument(
+            "--decoder-asr-init-weights",
+            type=str,
+            metavar="STR",
+            help="model to take decoder weights from (for initialization)",
+        )
+        parser.add_argument(
+            "--decoder-st-init-weights",
+            type=str,
+            metavar="STR",
+            help="model to take decoder weights from (for initialization)",
+        )
 
     @classmethod
     def build_encoder(cls, args):
@@ -229,7 +310,28 @@ class S2TTransformerModel(FairseqEncoderDecoderModel):
 
     @classmethod
     def build_decoder(cls, args, task, embed_tokens):
-        return TransformerDecoderScriptable(args, task.target_dictionary, embed_tokens)
+        decoder = TransformerDecoderScriptable(args, task.target_dictionary, embed_tokens)
+        if getattr(args, "decoder_asr_init_weights", None):
+            decoder = checkpoint_utils.load_decoder_weights(
+                component=decoder,
+                sub_component="asr",
+                checkpoint=args.decoder_asr_init_weights,
+            )
+            logger.info(
+                f"loaded pretrained ASR decoder from: "
+                f"{args.decoder_asr_init_weights}"
+            )
+        if getattr(args, "decoder_st_init_weights", None):
+            decoder = checkpoint_utils.load_decoder_weights(
+                component=decoder,
+                sub_component="st", 
+                checkpoint=args.decoder_st_init_weights,
+            )
+            logger.info(
+                f"loaded pretrained ST decoder from: "
+                f"{args.decoder_st_init_weights}"
+            )
+        return decoder
 
     @classmethod
     def build_model(cls, args, task):
@@ -299,7 +401,7 @@ class S2TTransformerEncoder(FairseqEncoder):
     def __init__(self, args):
         super().__init__(None)
 
-        self.encoder_freezing_updates = args.encoder_freezing_updates
+        self.encoder_freezing_updates = getattr(args, "encoder_freezing_updates", 0)
         self.num_updates = 0
 
         self.dropout_module = FairseqDropout(
@@ -310,14 +412,35 @@ class S2TTransformerEncoder(FairseqEncoder):
             self.embed_scale = 1.0
         self.padding_idx = 1
 
-        self.conv_version = args.conv_version
+        self.use_linear_before_cnn = getattr(args, "use_linear_before_cnn", False)
+        self.no_cnn = getattr(args, "no_cnn", False)
+        self.conv_version = getattr(args, "conv_version", "s2t_transformer")
         if self.conv_version == "s2t_transformer":
-            self.subsample = Conv1dSubsampler(
-                args.input_feat_per_channel * args.input_channels,
-                args.conv_channels,
-                args.encoder_embed_dim,
-                [int(k) for k in args.conv_kernel_sizes.split(",")],
-            )
+            if not self.use_linear_before_cnn:
+                self.subsample = Conv1dSubsampler(
+                    args.input_feat_per_channel * args.input_channels,
+                    args.conv_channels,
+                    args.encoder_embed_dim,
+                    [int(k) for k in args.conv_kernel_sizes.split(",")],
+                )
+            else:
+                if self.no_cnn:
+                    self.in_linear =  nn.Sequential(
+                        nn.Linear(args.input_feat_per_channel, args.encoder_embed_dim),
+                        nn.ReLU(),
+                    )
+                else:
+                    self.in_linear =  nn.Sequential(
+                        nn.Linear(args.input_feat_per_channel, 80),
+                        nn.ReLU(),
+                    )
+                    self.subsample = Conv1dSubsampler(
+                        80 * args.input_channels,
+                        args.conv_channels,
+                        args.encoder_embed_dim,
+                        [int(k) for k in args.conv_kernel_sizes.split(",")],
+                        args.conv_stride,
+                )
         elif self.conv_version == "convtransformer":
             self.subsample = Conv2dSubsampler(
                 args.input_channels,
@@ -343,13 +466,26 @@ class S2TTransformerEncoder(FairseqEncoder):
             self.ctc_proj = nn.Linear(args.encoder_embed_dim, args.tgt_dict_size)
 
     def _forward(self, src_tokens, src_lengths, return_all_hiddens=False):
-        x, input_lengths = self.subsample(src_tokens, src_lengths)
-        x = self.embed_scale * x
+        if not self.use_linear_before_cnn:
+            x, input_lengths = self.subsample(src_tokens, src_lengths)
+            x = self.embed_scale * x
 
-        encoder_padding_mask = lengths_to_padding_mask(input_lengths)
-        positions = self.embed_positions(encoder_padding_mask).transpose(0, 1)
-        x += positions
+            encoder_padding_mask = lengths_to_padding_mask(input_lengths) # bsz x max_len
+            positions = self.embed_positions(encoder_padding_mask).transpose(0, 1) # max_len x bsz x D_model
+            x += positions
+        else:
+            x = self.in_linear(src_tokens) # bsz x T_max x D_features_reduced
+            if self.no_cnn:   
+                x = x.transpose(0, 1).contiguous()
+                input_lengths = src_lengths
+            else:
+                x, input_lengths = self.subsample(x, src_lengths)
+                x = self.embed_scale * x
+            encoder_padding_mask = lengths_to_padding_mask(input_lengths) # bsz x max_len
+            positions = self.embed_positions(encoder_padding_mask).transpose(0, 1) # max_len x bsz x D_model
+            x += positions
         x = self.dropout_module(x)
+        embed_src_tokens = x
 
         encoder_states = []
 
@@ -370,6 +506,8 @@ class S2TTransformerEncoder(FairseqEncoder):
             "encoder_states": encoder_states,  # List[T x B x C]
             "src_tokens": [],
             "src_lengths": [],
+            "input_lengths": [input_lengths],
+            "embed_src_tokens": [embed_src_tokens], # T x B x C
         }
 
     def forward(self, src_tokens, src_lengths, return_all_hiddens=False):
@@ -438,7 +576,7 @@ class TransformerDecoderScriptable(TransformerDecoder):
         alignment_heads: Optional[int] = None,
     ):
         # call scriptable method from parent class
-        x, _ = self.extract_features_scriptable(
+        x, extra = self.extract_features_scriptable(
             prev_output_tokens,
             encoder_out,
             incremental_state,
@@ -446,7 +584,7 @@ class TransformerDecoderScriptable(TransformerDecoder):
             alignment_layer,
             alignment_heads,
         )
-        extra = {"encoder_out": encoder_out} if incremental_state is None else None
+        # extra = {"encoder_out": encoder_out} if incremental_state is None else None
         return x, extra
 
 

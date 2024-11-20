@@ -281,7 +281,8 @@ class BerardEncoder(FairseqEncoder):
         for k, s in self.conv_kernel_sizes_and_strides:
             p = k // 2
             input_lengths = (input_lengths.float() + 2 * p - k) / s + 1
-            input_lengths = input_lengths.floor().long()
+            # input_lengths = input_lengths.floor().long()
+            input_lengths = input_lengths.floor().long().cpu()
 
         packed_x = nn.utils.rnn.pack_padded_sequence(x, input_lengths)
 
